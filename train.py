@@ -21,6 +21,10 @@ LOG_EVERY = 20
 ROLLING_N = 50
 BEST_MIN_EPISODES = 200
 
+# Best 갱신 보수적으로: hit_rate 개선 최소 폭
+BEST_HIT_MARGIN = 1e-3   # 예: 0.001 (=0.1%p) 이상 좋아져야 best로 인정
+EPS_TIE = 1e-12          # tie 비교용
+
 
 def parse_args():
     p = argparse.ArgumentParser("shooter_game_ai - PPO trainer/eval (vec-gpu)")
@@ -83,18 +87,23 @@ def _try_load_checkpoint(agent: PPOAgentVec, path: str, device: str) -> Tuple[in
     return start_ep, global_step
 
 
-def _try_load_best_metrics(best_path: str, device: str) -> Tuple[Optional[float], Optional[int]]:
+def _try_load_best_metrics(best_path: str, device: str) -> Tuple[Optional[float], Optional[int], Optional[float]]:
+    """
+    returns: (best_hit_rate50, best_nohit_streak, best_avg50)
+    """
     if not os.path.isfile(best_path):
-        return None, None
+        return None, None, None
     try:
         ckpt = torch.load(best_path, map_location=device)
     except Exception:
-        return None, None
+        return None, None, None
     if not isinstance(ckpt, dict):
-        return None, None
+        return None, None, None
 
     bhr = ckpt.get("best_hit_rate50", None)
     bns = ckpt.get("best_nohit_streak", None)
+    bav = ckpt.get("best_avg50", None)
+
     try:
         bhr = float(bhr) if bhr is not None else None
     except Exception:
@@ -103,7 +112,12 @@ def _try_load_best_metrics(best_path: str, device: str) -> Tuple[Optional[float]
         bns = int(bns) if bns is not None else None
     except Exception:
         bns = None
-    return bhr, bns
+    try:
+        bav = float(bav) if bav is not None else None
+    except Exception:
+        bav = None
+
+    return bhr, bns, bav
 
 
 @torch.no_grad()
@@ -127,6 +141,8 @@ def _eval_vec(args):
     obs, _ = env.reset()
 
     done_eps = 0
+    next_log_ep = LOG_EVERY  # ✅ 고정 출력 타이밍
+
     survs = []
     hits = []
     ep_hit = torch.zeros((args.n_envs,), device=device, dtype=torch.bool)
@@ -136,7 +152,6 @@ def _eval_vec(args):
             print("[EXIT] ESC pressed -> stopping eval")
             break
 
-        # NOTE: PPOAgentVec.act() should already be torch-native. (No numpy copies)
         a, _, _ = agent.act(obs)
         obs, rew, done, info = env.step(a)
 
@@ -154,10 +169,12 @@ def _eval_vec(args):
             obs[d] = obs_reset[d]
             ep_hit[d] = False
 
-        if done_eps > 0 and (done_eps % LOG_EVERY == 0):
+        # ✅ done_eps가 한 번에 여러 개 뛰어도, LOG_EVERY 배수 출력이 절대 스킵되지 않음
+        while done_eps >= next_log_ep:
             avg_surv = float(np.mean(survs[-ROLLING_N:])) if survs else 0.0
             hit_rate = float(np.mean(hits[-ROLLING_N:])) if hits else 0.0
-            print(f"[EVAL EP {done_eps:7d}] survival_avg{ROLLING_N}={avg_surv:6.2f}s hit_rate{ROLLING_N}={hit_rate:4.2f}")
+            print(f"[EVAL EP {next_log_ep:7d}] survival_avg{ROLLING_N}={avg_surv:6.2f}s hit_rate{ROLLING_N}={hit_rate:4.2f}")
+            next_log_ep += LOG_EVERY
 
     avg_surv = float(np.mean(survs)) if survs else 0.0
     hit_rate = float(np.mean(hits)) if hits else 0.0
@@ -200,23 +217,19 @@ def _render_viewer(args):
 
     obs, _ = env.reset()
 
-    # viewer loop: run until episodes terminations processed (args.episodes)
     done_eps = 0
     ep_hit = torch.zeros((1,), device=device, dtype=torch.bool)
 
-    # render pacing: let env.render() internally cap, but we still avoid a busy-loop
     while done_eps < int(args.episodes):
         if esc_pressed():
             print("[EXIT] ESC pressed -> stopping render")
             break
 
-        # action
         a, _, _ = agent.act(obs)
         obs, rew, done, info = env.step(a)
 
         ep_hit = ep_hit | info["hit"]
 
-        # draw
         env.render()
 
         if bool(done.item()):
@@ -227,7 +240,6 @@ def _render_viewer(args):
             obs, _ = env.reset(mask=done)
             ep_hit[0] = False
 
-        # light sleep to reduce CPU spin (render() already caps visuals)
         time.sleep(0.001)
 
     try:
@@ -242,8 +254,6 @@ def main():
     args = parse_args()
     os.makedirs("checkpoints", exist_ok=True)
 
-    # If user did NOT pass --no-render:
-    # treat as "viewer" mode (single env, tkinter render, no training).
     if not args.no_render and not args.eval:
         _render_viewer(args)
         return
@@ -282,19 +292,25 @@ def main():
     recent_surv = deque(maxlen=ROLLING_N)
     recent_hit = deque(maxlen=ROLLING_N)
 
-    best_hit_rate, best_nohit_streak = _try_load_best_metrics(CKPT_BEST, device)
+    best_hit_rate, best_nohit_streak, best_avg50 = _try_load_best_metrics(CKPT_BEST, device)
     if best_hit_rate is None:
         best_hit_rate = 1e9
     if best_nohit_streak is None:
         best_nohit_streak = 0
+    if best_avg50 is None:
+        best_avg50 = 0.0
 
-    print(f"[BEST] best_hit_rate{ROLLING_N}(current)={best_hit_rate:.4f} best_nohit_streak={best_nohit_streak} best_path={CKPT_BEST}")
+    print(
+        f"[BEST] best_hit_rate{ROLLING_N}(current)={best_hit_rate:.4f} "
+        f"best_avg{ROLLING_N}={best_avg50:.2f}s best_nohit_streak={best_nohit_streak} best_path={CKPT_BEST}"
+    )
 
     obs, _ = env.reset()
     ep_hit = torch.zeros((args.n_envs,), device=device, dtype=torch.bool)
 
     nohit_streak = 0
     done_eps = 0
+    next_log_ep = LOG_EVERY  # ✅ 고정 출력/저장 타이밍
 
     run_step0 = global_step
     t0 = time.time()
@@ -334,7 +350,8 @@ def main():
             last_done=torch.zeros((args.n_envs,), device=device, dtype=torch.bool),
         )
 
-        if done_eps >= LOG_EVERY and (done_eps % LOG_EVERY == 0):
+        # ✅ done_eps가 점프해도 LOG_EVERY 배수(20,40,60...) 출력/저장이 절대 스킵되지 않음
+        while done_eps >= next_log_ep:
             dt = max(1e-6, time.time() - t0)
             run_steps = global_step - run_step0
             sps = run_steps / dt
@@ -344,40 +361,65 @@ def main():
             n = len(recent_hit)
 
             print(
-                f"[EP_DONE {done_eps:7d}/{args.episodes}] "
+                f"[EP_DONE {next_log_ep:7d}/{args.episodes}] "
                 f"survival_avg{ROLLING_N}={avg_surv:6.2f}s hit_rate{ROLLING_N}={hit_rate:4.2f} "
                 f"(n={n:2d}) steps={global_step} SPS={sps:7.1f}"
             )
 
-            payload = _pack_checkpoint(agent, ppo_cfg, env_cfg, done_eps, global_step)
+            payload = _pack_checkpoint(agent, ppo_cfg, env_cfg, next_log_ep, global_step)
             _save_checkpoint(payload, CKPT_LATEST)
 
+            # nohit_streak 업데이트는 "가장 최근 종료한 에피소드" 기준
             if len(recent_hit) > 0:
                 if recent_hit[-1] == 0.0:
                     nohit_streak += 1
                 else:
                     nohit_streak = 0
 
-            improved = (done_eps >= BEST_MIN_EPISODES) and (hit_rate < best_hit_rate - 1e-9)
-            tied = abs(hit_rate - best_hit_rate) <= 1e-12
-            tie_improved = (done_eps >= BEST_MIN_EPISODES) and tied and (nohit_streak > best_nohit_streak)
+            # -------------------------
+            # ✅ BEST 갱신 조건 강화
+            # - 최소 에피소드 수 충족
+            # - ROLLING_N 윈도우가 꽉 찼을 때만(best 판단 안정화)
+            # - hit_rate가 BEST_HIT_MARGIN 이상 유의미하게 좋아져야 함
+            # - 동률이면 avg_surv 개선 또는 nohit_streak 개선이 있어야 덮어씀
+            # -------------------------
+            window_ready = (n >= ROLLING_N)
+            eligible = (next_log_ep >= BEST_MIN_EPISODES) and window_ready
 
-            if improved or tie_improved:
+            improved = eligible and (hit_rate <= (best_hit_rate - BEST_HIT_MARGIN))
+
+            tied = abs(hit_rate - best_hit_rate) <= EPS_TIE
+            tie_surv_improved = eligible and tied and (avg_surv > best_avg50 + 1e-9)
+            tie_streak_improved = eligible and tied and (nohit_streak > best_nohit_streak)
+
+            if improved or tie_surv_improved or tie_streak_improved:
+                # update tracked bests
                 if improved:
                     best_hit_rate = hit_rate
-                best_nohit_streak = int(nohit_streak)
+                # tie case: hit_rate는 그대로, stability/avg가 좋아진 것만 반영
+                best_avg50 = max(best_avg50, avg_surv) if tied and not improved else avg_surv
+                best_nohit_streak = max(best_nohit_streak, int(nohit_streak)) if tied and not improved else int(nohit_streak)
 
                 best_payload = dict(payload)
                 best_payload["best_hit_rate50"] = float(best_hit_rate)
-                best_payload["best_avg50"] = float(avg_surv)
+                best_payload["best_avg50"] = float(best_avg50)
                 best_payload["best_nohit_streak"] = int(best_nohit_streak)
 
                 _save_checkpoint(best_payload, CKPT_BEST)
 
                 if improved:
-                    print(f"[BEST] updated best_hit_rate{ROLLING_N}={best_hit_rate:.4f} (best_nohit_streak={best_nohit_streak})")
+                    print(
+                        f"[BEST] updated best_hit_rate{ROLLING_N}={best_hit_rate:.4f} "
+                        f"best_avg{ROLLING_N}={best_avg50:.2f}s (best_nohit_streak={best_nohit_streak})"
+                    )
                 else:
-                    print(f"[BEST] overwritten (tie) hit_rate{ROLLING_N}={best_hit_rate:.4f} with improved stability: best_nohit_streak={best_nohit_streak}")
+                    reason = "avg_survival improved" if tie_surv_improved else "nohit_streak improved"
+                    print(
+                        f"[BEST] overwritten (tie) hit_rate{ROLLING_N}={best_hit_rate:.4f} "
+                        f"with {reason}: best_avg{ROLLING_N}={best_avg50:.2f}s best_nohit_streak={best_nohit_streak}"
+                    )
+
+            next_log_ep += LOG_EVERY
 
     print("done.")
 

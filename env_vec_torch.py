@@ -22,9 +22,9 @@ class EnvConfig:
     max_bullets: int = 512
     bullet_radius: float = 0.015
     bullet_speed_min: float = 0.25
-    bullet_speed_max: float = 0.80
+    bullet_speed_max: float = 0.50
     spawn_rate: float = 30.0
-    aim_noise: float = 0.15
+    aim_noise: float = 0.05
 
     # observation
     obs_k: int = 32
@@ -44,7 +44,7 @@ class EnvConfig:
     # Curriculum
     curriculum: bool = True
     curriculum_episodes: int = 800
-    spawn_rate_start: float = 2.0
+    spawn_rate_start: float = 5.0
     bullet_speed_start_factor: float = 0.55
     aim_noise_start_factor: float = 2.0
 
