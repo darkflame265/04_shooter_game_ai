@@ -22,8 +22,17 @@ ROLLING_N = 50
 BEST_MIN_EPISODES = 200
 
 # Best 갱신 보수적으로: hit_rate 개선 최소 폭
-BEST_HIT_MARGIN = 1e-3   # 예: 0.001 (=0.1%p) 이상 좋아져야 best로 인정
-EPS_TIE = 1e-12          # tie 비교용
+BEST_HIT_MARGIN = 1e-3
+EPS_TIE = 1e-12
+
+# -------------------------
+# Auto difficulty (manual diff01)
+# -------------------------
+AUTO_DIFF_ENABLED = True
+AUTO_DIFF_TARGET_HIT = 0.05     # hit_rate50 <= 0.05 이면 난이도 업
+AUTO_DIFF_STEP = 0.10           # diff01 증가폭 (0.0~1.0)
+AUTO_DIFF_COOLDOWN_LOGS = 3     # 난이도 업 후, 로그 N번은 대기 (너무 빨리 상승 방지)
+AUTO_DIFF_MIN_READY = ROLLING_N # 최소 window 꽉 찬 뒤에만 판단
 
 
 def parse_args():
@@ -35,13 +44,21 @@ def parse_args():
     return p.parse_args()
 
 
-def _pack_checkpoint(agent: PPOAgentVec, ppo_cfg: PPOConfig, env_cfg: EnvConfig, ep: int, global_step: int) -> Dict[str, Any]:
+def _pack_checkpoint(
+    agent: PPOAgentVec,
+    ppo_cfg: PPOConfig,
+    env_cfg: EnvConfig,
+    ep: int,
+    global_step: int,
+    manual_diff01: float,
+) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "net": agent.net.state_dict(),
         "cfg": vars(ppo_cfg),
         "env_cfg": vars(env_cfg),
         "episode": int(ep),
         "global_step": int(global_step),
+        "manual_diff01": float(manual_diff01),
     }
     try:
         payload["opt"] = agent.opt.state_dict()
@@ -56,15 +73,15 @@ def _save_checkpoint(payload: Dict[str, Any], path: str) -> None:
     print(f"[SAVE] {path}")
 
 
-def _try_load_checkpoint(agent: PPOAgentVec, path: str, device: str) -> Tuple[int, int]:
+def _try_load_checkpoint(agent: PPOAgentVec, path: str, device: str) -> Tuple[int, int, Optional[float]]:
     if not os.path.isfile(path):
         print(f"[CKPT] no checkpoint found at {path} -> starting fresh")
-        return 1, 0
+        return 1, 0, None
 
     ckpt = torch.load(path, map_location=device)
     if not (isinstance(ckpt, dict) and "net" in ckpt):
         print("[CKPT] invalid checkpoint format -> starting fresh")
-        return 1, 0
+        return 1, 0, None
 
     agent.net.load_state_dict(ckpt["net"])
     agent.net.to(device)
@@ -82,9 +99,17 @@ def _try_load_checkpoint(agent: PPOAgentVec, path: str, device: str) -> Tuple[in
 
     last_ep = int(ckpt.get("episode", 0))
     global_step = int(ckpt.get("global_step", 0))
+    manual_diff01 = ckpt.get("manual_diff01", None)
+    try:
+        manual_diff01 = float(manual_diff01) if manual_diff01 is not None else None
+    except Exception:
+        manual_diff01 = None
+
     start_ep = last_ep + 1
     print(f"[CKPT] loaded {path} -> resume from episode {start_ep}, global_step {global_step}")
-    return start_ep, global_step
+    if manual_diff01 is not None:
+        print(f"[CKPT] loaded manual_diff01={manual_diff01:.3f}")
+    return start_ep, global_step, manual_diff01
 
 
 def _try_load_best_metrics(best_path: str, device: str) -> Tuple[Optional[float], Optional[int], Optional[float]]:
@@ -141,7 +166,7 @@ def _eval_vec(args):
     obs, _ = env.reset()
 
     done_eps = 0
-    next_log_ep = LOG_EVERY  # ✅ 고정 출력 타이밍
+    next_log_ep = LOG_EVERY
 
     survs = []
     hits = []
@@ -169,7 +194,6 @@ def _eval_vec(args):
             obs[d] = obs_reset[d]
             ep_hit[d] = False
 
-        # ✅ done_eps가 한 번에 여러 개 뛰어도, LOG_EVERY 배수 출력이 절대 스킵되지 않음
         while done_eps >= next_log_ep:
             avg_surv = float(np.mean(survs[-ROLLING_N:])) if survs else 0.0
             hit_rate = float(np.mean(hits[-ROLLING_N:])) if hits else 0.0
@@ -183,13 +207,6 @@ def _eval_vec(args):
 
 @torch.no_grad()
 def _render_viewer(args):
-    """
-    Render-only mode:
-      - env = 1
-      - no training/update
-      - load CKPT_BEST (preferred), else CKPT_LATEST
-      - show tkinter window via env.render()
-    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("[RENDER] device:", device)
 
@@ -271,7 +288,10 @@ def main():
     np.random.seed(0)
     torch.manual_seed(0)
 
+    # ✅ episode 기반 커리큘럼은 끄고, trainer가 manual diff01로 제어
     env_cfg = EnvConfig(seed=0)
+    env_cfg.curriculum = False
+
     env = VecShooterEnvTorch(env_cfg, n_envs=args.n_envs, device=device)
 
     ppo_cfg = PPOConfig(
@@ -287,7 +307,7 @@ def main():
     )
     agent = PPOAgentVec(obs_dim=env.obs_dim, act_dim=env.action_dim, n_envs=args.n_envs, cfg=ppo_cfg)
 
-    start_ep, global_step = _try_load_checkpoint(agent, CKPT_LATEST, device)
+    start_ep, global_step, ckpt_diff = _try_load_checkpoint(agent, CKPT_LATEST, device)
 
     recent_surv = deque(maxlen=ROLLING_N)
     recent_hit = deque(maxlen=ROLLING_N)
@@ -305,12 +325,23 @@ def main():
         f"best_avg{ROLLING_N}={best_avg50:.2f}s best_nohit_streak={best_nohit_streak} best_path={CKPT_BEST}"
     )
 
+    # -------------------------
+    # ✅ manual difficulty state (0..1)
+    # -------------------------
+    manual_diff01 = float(ckpt_diff) if ckpt_diff is not None else 0.0
+    manual_diff01 = float(np.clip(manual_diff01, 0.0, 1.0))
+    env.set_manual_difficulty(manual_diff01)
+
+    diff_cooldown = 0  # log-iteration based cooldown
+
+    print(f"[DIFF] start manual_diff01={manual_diff01:.2f} spawn={env.get_spawn_rate_s():.2f}/s")
+
     obs, _ = env.reset()
     ep_hit = torch.zeros((args.n_envs,), device=device, dtype=torch.bool)
 
     nohit_streak = 0
     done_eps = 0
-    next_log_ep = LOG_EVERY  # ✅ 고정 출력/저장 타이밍
+    next_log_ep = LOG_EVERY
 
     run_step0 = global_step
     t0 = time.time()
@@ -350,7 +381,6 @@ def main():
             last_done=torch.zeros((args.n_envs,), device=device, dtype=torch.bool),
         )
 
-        # ✅ done_eps가 점프해도 LOG_EVERY 배수(20,40,60...) 출력/저장이 절대 스킵되지 않음
         while done_eps >= next_log_ep:
             dt = max(1e-6, time.time() - t0)
             run_steps = global_step - run_step0
@@ -360,13 +390,17 @@ def main():
             hit_rate = float(np.mean(recent_hit)) if recent_hit else 0.0
             n = len(recent_hit)
 
+            # ✅ 현재 초당 총알 생성수(난이도)
+            spawn_s = env.get_spawn_rate_s()
+
             print(
                 f"[EP_DONE {next_log_ep:7d}/{args.episodes}] "
-                f"survival_avg{ROLLING_N}={avg_surv:6.2f}s hit_rate{ROLLING_N}={hit_rate:4.2f} "
+                f"survival_avg{ROLLING_N}={avg_surv:6.2f}s hit_rate{ROLLING_N}={hit_rate:5.3f} "
+                f"spawn={spawn_s:6.2f}/s "
                 f"(n={n:2d}) steps={global_step} SPS={sps:7.1f}"
             )
 
-            payload = _pack_checkpoint(agent, ppo_cfg, env_cfg, next_log_ep, global_step)
+            payload = _pack_checkpoint(agent, ppo_cfg, env_cfg, next_log_ep, global_step, manual_diff01)
             _save_checkpoint(payload, CKPT_LATEST)
 
             # nohit_streak 업데이트는 "가장 최근 종료한 에피소드" 기준
@@ -377,13 +411,30 @@ def main():
                     nohit_streak = 0
 
             # -------------------------
-            # ✅ BEST 갱신 조건 강화
-            # - 최소 에피소드 수 충족
-            # - ROLLING_N 윈도우가 꽉 찼을 때만(best 판단 안정화)
-            # - hit_rate가 BEST_HIT_MARGIN 이상 유의미하게 좋아져야 함
-            # - 동률이면 avg_surv 개선 또는 nohit_streak 개선이 있어야 덮어씀
+            # ✅ Auto difficulty update
             # -------------------------
-            window_ready = (n >= ROLLING_N)
+            if diff_cooldown > 0:
+                diff_cooldown -= 1
+
+            window_ready = (n >= AUTO_DIFF_MIN_READY)
+            eligible_for_diff = AUTO_DIFF_ENABLED and window_ready and (diff_cooldown == 0)
+
+            # 조건: hit_rate50 <= 0.05 -> 다음 난이도 (diff01 step 업)
+            if eligible_for_diff and (hit_rate <= AUTO_DIFF_TARGET_HIT + 1e-12) and (manual_diff01 < 1.0 - 1e-9):
+                old = manual_diff01
+                manual_diff01 = float(np.clip(manual_diff01 + AUTO_DIFF_STEP, 0.0, 1.0))
+                env.set_manual_difficulty(manual_diff01)
+                diff_cooldown = int(AUTO_DIFF_COOLDOWN_LOGS)
+
+                print(
+                    f"[DIFF] up: {old:.2f} -> {manual_diff01:.2f}  "
+                    f"(hit_rate{ROLLING_N}={hit_rate:.3f} <= {AUTO_DIFF_TARGET_HIT:.3f})  "
+                    f"spawn={env.get_spawn_rate_s():.2f}/s"
+                )
+
+            # -------------------------
+            # ✅ BEST 갱신 조건 강화 (그대로)
+            # -------------------------
             eligible = (next_log_ep >= BEST_MIN_EPISODES) and window_ready
 
             improved = eligible and (hit_rate <= (best_hit_rate - BEST_HIT_MARGIN))
@@ -393,10 +444,8 @@ def main():
             tie_streak_improved = eligible and tied and (nohit_streak > best_nohit_streak)
 
             if improved or tie_surv_improved or tie_streak_improved:
-                # update tracked bests
                 if improved:
                     best_hit_rate = hit_rate
-                # tie case: hit_rate는 그대로, stability/avg가 좋아진 것만 반영
                 best_avg50 = max(best_avg50, avg_surv) if tied and not improved else avg_surv
                 best_nohit_streak = max(best_nohit_streak, int(nohit_streak)) if tied and not improved else int(nohit_streak)
 
@@ -404,6 +453,7 @@ def main():
                 best_payload["best_hit_rate50"] = float(best_hit_rate)
                 best_payload["best_avg50"] = float(best_avg50)
                 best_payload["best_nohit_streak"] = int(best_nohit_streak)
+                best_payload["manual_diff01"] = float(manual_diff01)  # 참고용(선택)
 
                 _save_checkpoint(best_payload, CKPT_BEST)
 

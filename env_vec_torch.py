@@ -20,11 +20,15 @@ class EnvConfig:
 
     # bullets (TARGET / final difficulty)
     max_bullets: int = 512
-    bullet_radius: float = 0.015
-    bullet_speed_min: float = 0.25
-    bullet_speed_max: float = 0.50
+    bullet_radius: float = 0.01
+
+    # ✅ speed/noise are FIXED (no curriculum)
+    bullet_speed_min: float = 0.1
+    bullet_speed_max: float = 0.2
+    aim_noise: float = 0.50
+
+    # ✅ only spawn_rate is scheduled by (curriculum/manual diff)
     spawn_rate: float = 30.0
-    aim_noise: float = 0.05
 
     # observation
     obs_k: int = 32
@@ -41,12 +45,14 @@ class EnvConfig:
 
     clear_bonus: float = 0.25
 
-    # Curriculum
+    # Curriculum (only affects spawn_rate)
     curriculum: bool = True
     curriculum_episodes: int = 800
-    spawn_rate_start: float = 5.0
-    bullet_speed_start_factor: float = 0.55
-    aim_noise_start_factor: float = 2.0
+    spawn_rate_start: float = 3.0
+
+    # (kept for compatibility; ignored)
+    bullet_speed_start_factor: float = 1.0
+    aim_noise_start_factor: float = 1.0
 
     seed: int = 0
 
@@ -65,6 +71,15 @@ class VecShooterEnvTorch:
 
     Rendering:
       - Provided via tkinter, BUT only supported for n_envs == 1.
+
+    Manual difficulty:
+      - Trainer can call set_manual_difficulty(diff01 in [0,1]) to override episode-based curriculum.
+      - If cfg.curriculum is False -> diff01 is controlled only by manual difficulty (default 1.0 unless set).
+      - If cfg.curriculum is True  -> diff01 uses episode-based curriculum AND can be overridden by manual if enabled.
+
+    Difficulty scheduling in this version:
+      - ✅ ONLY spawn_rate is scheduled (spawn_rate_start -> spawn_rate).
+      - bullet speeds + aim_noise are fixed (no curriculum scaling).
     """
 
     ACTIONS = torch.tensor(
@@ -112,6 +127,10 @@ class VecShooterEnvTorch:
         self.action_dim = int(self.actions.shape[0])
         self.obs_dim = 2 + 2 + 1 + (cfg.obs_k * 4)
 
+        # ---- manual difficulty override (0..1)
+        self._manual_diff01 = torch.ones((N,), device=self.device, dtype=torch.float32)
+        self._manual_diff_enabled = False
+
         # ---- render state (lazy)
         self._ui_inited = False
         self._tk = None
@@ -125,6 +144,37 @@ class VecShooterEnvTorch:
         self._item_trail = []
         self._trail = []
 
+    # -------------------------
+    # manual difficulty API (for trainer)
+    # -------------------------
+    def set_manual_difficulty(self, diff01: float, enabled: bool = True) -> None:
+        """
+        Set a global/manual difficulty in [0,1] applied to all envs.
+        When enabled=True, diff01 used in _current_difficulty_params() becomes manual value.
+        """
+        d = float(diff01)
+        if d != d:  # NaN guard
+            d = 0.0
+        d = max(0.0, min(1.0, d))
+        self._manual_diff01.fill_(d)
+        self._manual_diff_enabled = bool(enabled)
+        # keep diff01 synced for debug/info
+        self.diff01.fill_(d)
+
+    def get_manual_difficulty(self) -> float:
+        return float(self._manual_diff01[0].detach().float().cpu().item())
+
+    @torch.no_grad()
+    def get_spawn_rate_s(self) -> float:
+        """
+        Current (effective) spawn rate in bullets/sec for env0, after curriculum/manual diff applied.
+        """
+        spawn = self._current_spawn_rate()
+        return float(spawn[0].detach().float().cpu().item())
+
+    # -------------------------
+    # env API
+    # -------------------------
     def reset(self, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict]:
         if mask is None:
             mask = torch.ones((self.n,), device=self.device, dtype=torch.bool)
@@ -155,7 +205,11 @@ class VecShooterEnvTorch:
             self._trail.clear()
 
         obs = self._get_obs()
-        info = {"t": self.t.clone(), "episode": self.episode_count.clone(), "diff01": self.diff01.clone()}
+        info = {
+            "t": self.t.clone(),
+            "episode": self.episode_count.clone(),
+            "diff01": self.diff01.clone(),
+        }
         return obs, info
 
     @torch.no_grad()
@@ -212,7 +266,6 @@ class VecShooterEnvTorch:
         rew = torch.where(timeout & (~hit), rew + float(cfg.clear_bonus), rew)
 
         if cfg.render_draw_trails and self.n == 1:
-            # store trail on CPU for tkinter speed
             p0 = self.player_pos[0].detach().float().cpu()
             self._trail.append((float(p0[0].item()), float(p0[1].item())))
             if len(self._trail) > 2000:
@@ -231,31 +284,35 @@ class VecShooterEnvTorch:
         return obs, rew, done, info
 
     # -------------------------
-    # curriculum
+    # curriculum / difficulty
     # -------------------------
     def _update_curriculum(self, mask: torch.Tensor) -> None:
         cfg = self.cfg
+
+        if self._manual_diff_enabled:
+            self.diff01[mask] = self._manual_diff01[mask]
+            return
+
         if not cfg.curriculum:
             self.diff01[mask] = 1.0
             return
+
         denom = max(1, int(cfg.curriculum_episodes))
         d = (self.episode_count[mask].float() - 1.0) / float(denom)
         self.diff01[mask] = d.clamp(0.0, 1.0)
 
-    def _current_difficulty_params(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _effective_diff01(self) -> torch.Tensor:
+        if self._manual_diff_enabled:
+            return self._manual_diff01
+        return self.diff01
+
+    def _current_spawn_rate(self) -> torch.Tensor:
+        """
+        ✅ the only scheduled difficulty parameter.
+        """
         cfg = self.cfg
-        d = self.diff01
-
-        spawn = (1.0 - d) * float(cfg.spawn_rate_start) + d * float(cfg.spawn_rate)
-
-        s0 = float(cfg.bullet_speed_start_factor)
-        sp_min = float(cfg.bullet_speed_min) * ((1.0 - d) * s0 + d * 1.0)
-        sp_max = float(cfg.bullet_speed_max) * ((1.0 - d) * s0 + d * 1.0)
-
-        n0 = float(cfg.aim_noise_start_factor)
-        aim = float(cfg.aim_noise) * ((1.0 - d) * n0 + d * 1.0)
-
-        return spawn, sp_min, sp_max, aim
+        d = self._effective_diff01()
+        return (1.0 - d) * float(cfg.spawn_rate_start) + d * float(cfg.spawn_rate)
 
     # -------------------------
     # internals
@@ -267,7 +324,8 @@ class VecShooterEnvTorch:
         B = int(cfg.max_bullets)
         w = float(cfg.world_size)
 
-        spawn_rate, sp_min, sp_max, aim_noise = self._current_difficulty_params()
+        # ✅ spawn rate only is difficulty-dependent
+        spawn_rate = self._current_spawn_rate()
         lam = spawn_rate * float(cfg.dt)
 
         n_spawn = torch.poisson(lam, generator=self._gen).to(torch.int64)
@@ -314,11 +372,14 @@ class VecShooterEnvTorch:
         pos[m, 0] = u[m] * w
         pos[m, 1] = w
 
+        # ✅ speed + aim noise are FIXED (no curriculum scaling)
         to_p = self.player_pos.view(N, 1, 2) - pos
         ang = torch.atan2(to_p[..., 1], to_p[..., 0])
-        ang = ang + torch.randn((N, max_k), device=self.device, generator=self._gen) * aim_noise.view(N, 1)
+        ang = ang + torch.randn((N, max_k), device=self.device, generator=self._gen) * float(cfg.aim_noise)
 
-        spd = torch.rand((N, max_k), device=self.device, generator=self._gen) * (sp_max - sp_min).view(N, 1) + sp_min.view(N, 1)
+        sp_min = float(cfg.bullet_speed_min)
+        sp_max = float(cfg.bullet_speed_max)
+        spd = torch.rand((N, max_k), device=self.device, generator=self._gen) * (sp_max - sp_min) + sp_min
         vel = torch.stack([torch.cos(ang), torch.sin(ang)], dim=-1) * spd.unsqueeze(-1)
 
         env_i = torch.arange(N, device=self.device).view(N, 1).expand(N, max_k)
@@ -444,7 +505,6 @@ class VecShooterEnvTorch:
         W = int(self.cfg.render_size)
         w = float(self.cfg.world_size)
 
-        # pull 1-env state to CPU for tkinter (cheap; only on render mode)
         p0 = self.player_pos[0].detach().float().cpu()
         alive0 = self.bul_alive[0].detach().cpu()
         bul0 = self.bul_pos[0].detach().float().cpu()
@@ -454,30 +514,27 @@ class VecShooterEnvTorch:
             y = (1.0 - float(xy[1].item()) / w) * (W - 1)
             return x, y
 
-        spawn_rate, sp_min, sp_max, aim = self._current_difficulty_params()
+        spawn_rate = self._current_spawn_rate()
         hud_txt = (
             f"EP {int(self.episode_count[0].item())}  step {int(self.step_count[0].item())}  t={float(self.t[0].item()):.2f}s  hit={int(self.last_hit[0].item())}\n"
-            f"bullets={int(alive0.sum().item())}  diff={float(self.diff01[0].item()):.2f}\n"
-            f"spawn={float(spawn_rate[0].item()):.2f}/s  spd=[{float(sp_min[0].item()):.2f},{float(sp_max[0].item()):.2f}]  aim_noise={float(aim[0].item()):.3f}"
+            f"bullets={int(alive0.sum().item())}  diff={float(self._effective_diff01()[0].item()):.2f}\n"
+            f"spawn={float(spawn_rate[0].item()):.2f}/s"
         )
         try:
             self._hud_var.set(hud_txt)
         except Exception:
             pass
 
-        # player
         px, py = to_px(p0)
         pr = max(3, int(self.cfg.player_radius / w * W))
         canvas.coords(self._item_player, px - pr, py - pr, px + pr, py + pr)
 
-        # bullets
         alive_idx = torch.where(alive0)[0]
         br = max(2, int(self.cfg.bullet_radius / w * W))
 
         for it in self._item_bullets:
             canvas.itemconfigure(it, state="hidden")
 
-        # draw up to max_bullets items (pre-allocated)
         for j in range(min(int(alive_idx.numel()), len(self._item_bullets))):
             i = int(alive_idx[j].item())
             bx, by = to_px(bul0[i])
@@ -485,14 +542,13 @@ class VecShooterEnvTorch:
             canvas.coords(it, bx - br, by - br, bx + br, by + br)
             canvas.itemconfigure(it, state="normal")
 
-        # trails
         if self.cfg.render_draw_trails:
             pts = self._trail[-600:] if len(self._trail) > 0 else []
             for it in self._item_trail:
                 canvas.itemconfigure(it, state="hidden")
             need = max(0, len(pts) - 1)
             while len(self._item_trail) < need:
-                self._item_trail.append(canvas.create_line(0, 0, 0, 0, fill="#7a7a86", width=1))
+                self._item_trail.append(self._canvas.create_line(0, 0, 0, 0, fill="#7a7a86", width=1))
             for k in range(need):
                 x0 = (pts[k][0] / w) * (W - 1)
                 y0 = (1.0 - pts[k][1] / w) * (W - 1)
