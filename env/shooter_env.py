@@ -12,22 +12,23 @@ class EnvConfig:
     # world
     world_size: float = 1.0  # coordinate range: [0, world_size]
     dt: float = 1.0 / 60.0
-    max_steps: int = 60 * 20  # 20 seconds
+    max_steps: int = 60 * 60  # ✅ 60 seconds (was 20 seconds)
 
     # player
     player_speed: float = 0.55  # units / sec
     player_radius: float = 0.01
 
     # bullets (TARGET / final difficulty)
-    max_bullets: int = 64
+    max_bullets: int = 256
     bullet_radius: float = 0.015
     bullet_speed_min: float = 0.25
-    bullet_speed_max: float = 0.80
-    spawn_rate: float = 6.0  # bullets / sec (Poisson-like)
+    bullet_speed_max: float = 0.50
+    spawn_rate: float = 6.0  # ✅ start at 30 bullets/sec (baseline difficulty)
     aim_noise: float = 0.15  # radians
 
     # observation
-    obs_k: int = 16  # number of nearest bullets encoded
+    # ✅ 안정화 목적: 더 많은 탄을 보게 해서 tail-risk 감소
+    obs_k: int = 32  # was 16
 
     # reward shaping
     alive_reward: float = 0.01
@@ -35,14 +36,24 @@ class EnvConfig:
     move_penalty: float = 0.0005
     wall_penalty: float = 0.002  # penalize hugging boundary
 
+    # ✅ NEW: near-miss penalty (tail hit 줄이기 핵심)
+    near_miss_enabled: bool = True
+    near_miss_margin: float = 0.020  # world units. (player+bullet radius)보다 조금 크게
+    near_miss_coef: float = 0.010    # step당 최대 페널티 크기 (너무 크면 과도 회피/벽몰림)
+
+    # ✅ NEW: clear bonus (60초 클리어를 더 선호)
+    clear_bonus: float = 0.25
+
     # --------
     # Curriculum (start easy -> ramp to target)
     # --------
-    curriculum: bool = True
-    curriculum_episodes: int = 800  # number of episodes to reach target difficulty
-    spawn_rate_start: float = 2.0   # easier starting spawn rate
-    bullet_speed_start_factor: float = 0.55  # start speeds scaled down
-    aim_noise_start_factor: float = 2.0      # start with more noise (easier)
+    # ✅ 기본 난이도 30으로 "바로 시작"하려면 커리큘럼을 끄거나,
+    #    spawn_rate_start를 spawn_rate와 같게 만들어야 함.
+    curriculum: bool = False                 # ✅ disable curriculum (was True)
+    curriculum_episodes: int = 800
+    spawn_rate_start: float = 6.0           # (kept consistent)
+    bullet_speed_start_factor: float = 0.55
+    aim_noise_start_factor: float = 2.0
 
     # --------
     # Rendering (tkinter; no extra deps)
@@ -109,7 +120,7 @@ class ShooterEnv:
 
         # derived
         self.action_dim = int(self.ACTIONS.shape[0])
-        self.obs_dim = 2 + 2 + 1 + (cfg.obs_k * 4)  # player xy + player xy-0.5 + time + K*(dx,dy,vx,vy)
+        self.obs_dim = 2 + 2 + 1 + (cfg.obs_k * 4)
 
         # rendering state (tkinter; lazy init)
         self._ui_inited = False
@@ -189,7 +200,7 @@ class ShooterEnv:
         # base reward
         reward += cfg.alive_reward
 
-        # movement penalty (encourage efficiency; not too strong)
+        # movement penalty
         reward -= cfg.move_penalty * float(np.linalg.norm(dp) / (cfg.player_speed * cfg.dt + 1e-8))
 
         # wall penalty: discourage boundary hugging
@@ -202,12 +213,19 @@ class ShooterEnv:
         if dmin < margin:
             reward -= cfg.wall_penalty * float((margin - dmin) / margin)
 
+        # near-miss shaping
+        if cfg.near_miss_enabled:
+            nm = self._near_miss_penalty()
+            reward -= nm
+
         if hit:
             reward -= cfg.hit_penalty
             done = True
 
         if self.step_count >= cfg.max_steps:
             done = True
+            if not hit:
+                reward += cfg.clear_bonus
 
         if cfg.render_draw_trails:
             self._trail.append(self.player_pos.copy())
@@ -237,11 +255,6 @@ class ShooterEnv:
         self.diff01 = float(min(1.0, (self.episode_count - 1) / denom))
 
     def _current_difficulty_params(self) -> Tuple[float, float, float, float]:
-        """
-        Returns (spawn_rate, bullet_speed_min, bullet_speed_max, aim_noise) for current diff01.
-        - diff01=0: easy
-        - diff01=1: target (cfg.spawn_rate, cfg.bullet_speed_min/max, cfg.aim_noise)
-        """
         cfg = self.cfg
         d = float(self.diff01)
 
@@ -279,13 +292,13 @@ class ShooterEnv:
         for i in idxs:
             edge = int(self.rng.integers(0, 4))
             u = float(self.rng.random())
-            if edge == 0:      # left
+            if edge == 0:
                 pos = np.array([0.0, u * w], dtype=np.float32)
-            elif edge == 1:    # right
+            elif edge == 1:
                 pos = np.array([w, u * w], dtype=np.float32)
-            elif edge == 2:    # bottom
+            elif edge == 2:
                 pos = np.array([u * w, 0.0], dtype=np.float32)
-            else:              # top
+            else:
                 pos = np.array([u * w, w], dtype=np.float32)
 
             to_p = (self.player_pos - pos).astype(np.float32)
@@ -325,14 +338,28 @@ class ShooterEnv:
         r = cfg.player_radius + cfg.bullet_radius
         return bool(np.any(dist2 <= (r * r)))
 
+    def _near_miss_penalty(self) -> float:
+        cfg = self.cfg
+        alive = self.bul_alive
+        if not np.any(alive):
+            return 0.0
+
+        d = self.bul_pos[alive] - self.player_pos[None, :]
+        dist = np.sqrt(np.sum(d * d, axis=1))
+        min_dist = float(np.min(dist))
+
+        touch = float(cfg.player_radius + cfg.bullet_radius)
+        thr = touch + float(cfg.near_miss_margin)
+
+        if min_dist >= thr:
+            return 0.0
+
+        denom = max(1e-8, (thr - touch))
+        x = float((thr - min_dist) / denom)
+        x = float(np.clip(x, 0.0, 1.0))
+        return float(cfg.near_miss_coef * x)
+
     def _get_obs(self) -> np.ndarray:
-        """
-        Observation: float32 vector
-          - player xy in [0,1]
-          - player xy centered (xy - 0.5)
-          - time progress in [0,1]
-          - K nearest bullets: (dx, dy, vx, vy) in roughly [-1,1] scale
-        """
         cfg = self.cfg
         w = cfg.world_size
 
@@ -366,12 +393,8 @@ class ShooterEnv:
     # tkinter rendering (optional; no extra deps)
     # -------------------------
     def render(self) -> None:
-        """
-        tkinter visualization. Call this each step if you want a live window.
-        """
         self._ui_lazy_init()
 
-        # FPS cap (render-only)
         now = time.time()
         min_dt = 1.0 / max(1, int(self.cfg.render_fps))
         if (now - self._last_render_ts) < min_dt:
@@ -380,8 +403,6 @@ class ShooterEnv:
 
         root = self._root
         canvas = self._canvas
-
-        # if window closed, just stop rendering
         if root is None or canvas is None:
             return
 
@@ -394,12 +415,10 @@ class ShooterEnv:
         w = float(self.cfg.world_size)
 
         def to_px(pos: np.ndarray) -> Tuple[float, float]:
-            # world (0..w) -> screen (0..W), y flipped
             x = (float(pos[0]) / w) * (W - 1)
             y = (1.0 - float(pos[1]) / w) * (W - 1)
             return x, y
 
-        # update HUD
         spawn_rate, sp_min, sp_max, aim = self._current_difficulty_params()
         hud_txt = (
             f"EP {self.episode_count}  step {self.step_count}  t={self.t:.2f}s  hit={int(self.last_hit)}\n"
@@ -411,20 +430,16 @@ class ShooterEnv:
         except Exception:
             pass
 
-        # player
         px, py = to_px(self.player_pos)
         pr = max(3, int(self.cfg.player_radius / w * W))
         canvas.coords(self._item_player, px - pr, py - pr, px + pr, py + pr)
 
-        # bullets: keep a pool of oval items up to max_bullets
         alive_idx = np.where(self.bul_alive)[0]
         br = max(2, int(self.cfg.bullet_radius / w * W))
 
-        # hide all bullets first (cheap)
         for it in self._item_bullets:
             canvas.itemconfigure(it, state="hidden")
 
-        # show alive bullets
         for j, i in enumerate(alive_idx.tolist()):
             if j >= len(self._item_bullets):
                 break
@@ -433,14 +448,10 @@ class ShooterEnv:
             canvas.coords(it, bx - br, by - br, bx + br, by + br)
             canvas.itemconfigure(it, state="normal")
 
-        # optional trail (limited)
         if self.cfg.render_draw_trails:
-            # rebuild occasionally; keep it simple
             pts = self._trail[-600:] if len(self._trail) > 0 else []
-            # hide all
             for it in self._item_trail:
                 canvas.itemconfigure(it, state="hidden")
-            # draw lines segments
             need = max(0, len(pts) - 1)
             while len(self._item_trail) < need:
                 self._item_trail.append(canvas.create_line(0, 0, 0, 0, fill="#7a7a86", width=1))
@@ -451,7 +462,6 @@ class ShooterEnv:
                 canvas.coords(it, x0, y0, x1, y1)
                 canvas.itemconfigure(it, state="normal")
 
-        # flush UI
         try:
             root.update()
         except Exception:
@@ -472,25 +482,20 @@ class ShooterEnv:
 
         W = int(self.cfg.render_size)
 
-        # HUD
         self._hud_var = tk.StringVar(value="")
         hud = tk.Label(self._root, textvariable=self._hud_var, justify="left", anchor="w", font=("Consolas", 10))
         hud.pack(fill="x")
 
-        # Canvas
         canvas = tk.Canvas(self._root, width=W, height=W, bg="#121216", highlightthickness=0)
         canvas.pack()
 
-        # border
         self._item_border = canvas.create_rectangle(2, 2, W - 2, W - 2, outline="#505058", width=2)
 
-        # pre-create bullets pool
         self._item_bullets = []
         for _ in range(int(self.cfg.max_bullets)):
             it = canvas.create_oval(0, 0, 0, 0, fill="#f0e65a", outline="", state="hidden")
             self._item_bullets.append(it)
 
-        # player
         self._item_player = canvas.create_oval(0, 0, 0, 0, fill="#5adcff", outline="")
 
         self._canvas = canvas
