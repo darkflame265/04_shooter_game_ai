@@ -44,22 +44,25 @@ DIFF_SEARCH_ITERS = 18            # 이분탐색 반복 수 (충분)
 # -------------------------
 AUTO_TUNE_ENABLED = True
 
-# 목표 KL (PPO에서 매우 흔한 자동 lr 튜닝 기준)
-AUTO_TUNE_TARGET_KL = 0.010
-AUTO_TUNE_LR_UP = 1.10
-AUTO_TUNE_LR_DOWN = 0.50
-AUTO_TUNE_LR_MIN = 3e-5
-AUTO_TUNE_LR_MAX = 3e-4
+# 목표 KL
+AUTO_TUNE_TARGET_KL = 0.003
+AUTO_TUNE_LR_UP = 1.15
+AUTO_TUNE_LR_DOWN = 0.60
+AUTO_TUNE_LR_MIN = 1e-5
+AUTO_TUNE_LR_MAX = 1e-3
 
 # plateau 감지 (로그 단위)
-PLATEAU_WINDOW_LOGS = 6         # 최근 로그 몇 번을 보고 정체 판단
-PLATEAU_MIN_SURV_IMPROVE = 1.0  # surv_avg50이 이 정도 이상 개선이 없으면 정체로 간주
-PLATEAU_HIT_WORSEN_EPS = 0.06   # hit_rate가 이만큼 이상 나빠지면 "불안정"으로 간주
+PLATEAU_WINDOW_LOGS = 6
+PLATEAU_MIN_SURV_IMPROVE = 1.0
+
+# ✅ hit_rate 중심 튜닝 임계값(낮을수록 좋음)
+HIT_IMPROVE_EPS = 0.03
+HIT_WORSEN_EPS = 0.03
 
 # ent_coef 조정 폭/범위
-ENT_UP = 1.35
-ENT_DOWN = 0.95
-ENT_MIN = 0.002
+ENT_UP = 1.02
+ENT_DOWN = 0.98
+ENT_MIN = 0.003
 ENT_MAX = 0.020
 
 
@@ -391,6 +394,9 @@ def _find_diff_for_target_spawn(env: VecShooterEnvTorch, target_spawn: float) ->
     return float(best_diff)
 
 
+# -------------------------
+# ✅ LR/ENT helpers (optimizer truth)
+# -------------------------
 def _get_opt_lr(agent: PPOAgentVec) -> float:
     try:
         return float(agent.opt.param_groups[0]["lr"])
@@ -399,15 +405,15 @@ def _get_opt_lr(agent: PPOAgentVec) -> float:
 
 
 def _set_opt_lr(agent: PPOAgentVec, lr: float) -> None:
+    lr = float(lr)
     try:
         for g in agent.opt.param_groups:
-            g["lr"] = float(lr)
+            g["lr"] = lr
     except Exception:
         pass
 
 
 def _get_ent_coef(agent: PPOAgentVec, ppo_cfg: PPOConfig) -> float:
-    # PPOAgentVec 구현이 cfg를 참조하는지/내부 변수를 쓰는지 모르니 둘 다 대응
     if hasattr(agent, "cfg") and hasattr(agent.cfg, "ent_coef"):
         try:
             return float(agent.cfg.ent_coef)
@@ -436,7 +442,6 @@ def main():
     args = parse_args()
     os.makedirs("checkpoints", exist_ok=True)
 
-    # render-only mode
     if not args.no_render:
         _render_viewer(args)
         return
@@ -473,7 +478,6 @@ def main():
     recent_surv = deque(maxlen=ROLLING_N)
     recent_hit = deque(maxlen=ROLLING_N)
 
-    # plateau 판단용 로그 히스토리
     hist_avg_surv = deque(maxlen=PLATEAU_WINDOW_LOGS)
     hist_hit_rate = deque(maxlen=PLATEAU_WINDOW_LOGS)
 
@@ -513,7 +517,6 @@ def main():
     run_step0 = global_step
     t0 = time.time()
 
-    # 마지막으로 적용된 (자동 튜닝) 로그용
     last_tune_msg = ""
 
     while done_eps < int(args.episodes):
@@ -545,16 +548,12 @@ def main():
             obs = next_obs
             global_step += int(args.n_envs)
 
-        # --- PPO update
+        # --- PPO update (agent 내부에서 lr_adapt가 있으면 여기서 lr이 바뀔 수 있음)
         upd_stats = agent.finish_and_update(
             last_obs=obs,
             last_done=torch.zeros((args.n_envs,), device=device, dtype=torch.bool),
         )
-        # upd_stats는 None일 수도 있음 (agent_vec 구현에 따라)
 
-        # -------------------------
-        # LOG (print ONCE)
-        # -------------------------
         if done_eps >= next_log_ep:
             dt = max(1e-6, time.time() - t0)
             run_steps = global_step - run_step0
@@ -567,77 +566,116 @@ def main():
             spawn_s = float(env.get_spawn_rate_s())
             global_episode = base_global_episode + int(done_eps)
 
-            # 히스토리 업데이트(plateau 감지)
             hist_avg_surv.append(avg_surv)
             hist_hit_rate.append(hit_rate)
 
-            # -------------------------
-            # Auto PPO tuning
-            # -------------------------
             tune_msg = ""
             if AUTO_TUNE_ENABLED and (n >= AUTO_DIFF_MIN_READY):
-                # 1) KL 기반 lr 자동조절(가능하면)
                 approx_kl = None
-                entropy = None
-                clipfrac = None
-
+                agent_lr_after_update = None
                 if isinstance(upd_stats, dict):
-                    # agent_vec이 stats를 dict로 리턴하는 경우를 지원
                     approx_kl = upd_stats.get("approx_kl", None)
-                    entropy = upd_stats.get("entropy", None)
-                    clipfrac = upd_stats.get("clipfrac", None)
+                    agent_lr_after_update = upd_stats.get("lr", None)  # agent_vec 내부 최종 lr (있으면)
 
-                # lr 조절 (KL 정보가 있을 때만)
+                # -------------------------
+                # ✅ KL 기반 LR 튜닝 (optimizer truth)
+                # -------------------------
                 if approx_kl is not None:
                     try:
                         kl = float(approx_kl)
-                        lr0 = _get_opt_lr(agent)
-                        lr1 = lr0
 
-                        if kl > (2.0 * AUTO_TUNE_TARGET_KL):
-                            lr1 = max(AUTO_TUNE_LR_MIN, lr0 * AUTO_TUNE_LR_DOWN)
-                            _set_opt_lr(agent, lr1)
-                            tune_msg += f" lr{lr0:.2e}->{lr1:.2e}(kl={kl:.4f})"
-                        elif kl < (0.5 * AUTO_TUNE_TARGET_KL):
-                            lr1 = min(AUTO_TUNE_LR_MAX, lr0 * AUTO_TUNE_LR_UP)
-                            _set_opt_lr(agent, lr1)
-                            tune_msg += f" lr{lr0:.2e}->{lr1:.2e}(kl={kl:.4f})"
+                        # ✅ optimizer가 "진실" (cfg 말고 여기만 본다)
+                        lr0 = _get_opt_lr(agent)
+
+                        # ---- 트리거 구간 완화 (기존 2.0 / 0.5는 너무 멀어서 거의 안 걸림)
+                        # 네 로그(kl≈0.003 전후)에서는 target=0.005일 때 up/down 둘 다 안 걸리는 게 정상이라서,
+                        # 여기서만 배수 완화해서 실제로 움직이게 함.
+                        KL_HIGH_MULT = 1.50  # kl > 1.5*target => down
+                        KL_LOW_MULT  = 0.80  # kl < 0.8*target => up
+
+                        lr_target = lr0
+                        if kl > (KL_HIGH_MULT * AUTO_TUNE_TARGET_KL):
+                            lr_target = lr0 * AUTO_TUNE_LR_DOWN
+                        elif kl < (KL_LOW_MULT * AUTO_TUNE_TARGET_KL):
+                            lr_target = lr0 * AUTO_TUNE_LR_UP
+
+                        # ---- clamp (항상)
+                        lr_target = float(np.clip(lr_target, AUTO_TUNE_LR_MIN, AUTO_TUNE_LR_MAX))
+
+                        # ---- 너무 미세한 차이는 무시 (float 잡음 방지)
+                        # 절대 eps + 상대 eps 둘 다 사용
+                        ABS_EPS = 1e-12
+                        REL_EPS = 1e-6  # lr 스케일(1e-4~1e-3)에서 충분
+                        should_set = abs(lr_target - lr0) > max(ABS_EPS, abs(lr0) * REL_EPS)
+
+                        if should_set:
+                            _set_opt_lr(agent, lr_target)
+
+                        # ✅ set 직후 다시 optimizer에서 읽기
+                        lr1 = _get_opt_lr(agent)
+
+                        # 출력: (train.py가 적용) + (agent 내부 update가 적용했을 수도 있는 lr)
+                        tune_msg += (
+                            f" lr{lr0:.2e}->{lr1:.2e}(kl={kl:.4f},"
+                            f" trg={AUTO_TUNE_TARGET_KL:.4f},"
+                            f" lo={KL_LOW_MULT:.2f} hi={KL_HIGH_MULT:.2f})"
+                        )
+
+                        # 디버깅: 왜 안 움직였는지 바로 보이게
+                        if not should_set:
+                            tune_msg += " [noop]"
+                        else:
+                            if lr1 == lr0:
+                                tune_msg += " [set-but-same]"  # clamp로 같아졌거나 opt 그룹 이슈
+
+                        if agent_lr_after_update is not None:
+                            try:
+                                tune_msg += f" agent_lr={float(agent_lr_after_update):.2e}"
+                            except Exception:
+                                pass
                     except Exception:
                         pass
 
-                # 2) plateau 기반 ent_coef 조절 (KL 없어도 동작)
-                plateau = False
-                unstable = False
-                if len(hist_avg_surv) >= PLATEAU_WINDOW_LOGS:
-                    # surv 개선이 거의 없는지
-                    if (max(hist_avg_surv) - min(hist_avg_surv)) < PLATEAU_MIN_SURV_IMPROVE:
-                        plateau = True
 
-                    # hit_rate가 최근에 나빠지는지(불안정)
-                    if (hist_hit_rate[-1] - min(hist_hit_rate)) > PLATEAU_HIT_WORSEN_EPS:
-                        unstable = True
+                # -------------------------
+                # ent_coef: hit_rate 중심
+                # -------------------------
+                plateau = False
+                improved = False
+                worsened = False
+
+                if len(hist_hit_rate) >= PLATEAU_WINDOW_LOGS:
+                    prev = list(hist_hit_rate)[:-1]
+                    cur = float(hist_hit_rate[-1])
+                    prev_best = float(min(prev))  # 낮을수록 좋음
+
+                    improved = (cur <= prev_best - HIT_IMPROVE_EPS)
+                    worsened = (cur >= prev_best + HIT_WORSEN_EPS)
+
+                    if len(hist_avg_surv) >= PLATEAU_WINDOW_LOGS:
+                        surv_span = float(max(hist_avg_surv) - min(hist_avg_surv))
+                        if (not improved) and (not worsened) and (surv_span < PLATEAU_MIN_SURV_IMPROVE):
+                            plateau = True
 
                 ent0 = _get_ent_coef(agent, ppo_cfg)
                 ent1 = ent0
 
-                if unstable:
-                    # 불안정하면 탐색/업데이트를 약간 줄이는 편이 안전
-                    ent1 = max(ENT_MIN, ent0 * ENT_DOWN)
-                elif plateau:
-                    # 정체면 탐색 늘려서 탈출 시도
+                if worsened:
                     ent1 = min(ENT_MAX, ent0 * ENT_UP)
+                elif plateau:
+                    ent1 = min(ENT_MAX, ent0 * ENT_UP)
+                elif improved:
+                    ent1 = max(ENT_MIN, ent0 * ENT_DOWN)
 
                 if abs(ent1 - ent0) > 1e-12:
                     _set_ent_coef(agent, ppo_cfg, ent1)
-                    tune_msg += f" ent{ent0:.4f}->{ent1:.4f}"
+                    tag = "worsen" if worsened else ("plateau" if plateau else "improve")
+                    tune_msg += f" ent{ent0:.4f}->{ent1:.4f}({tag})"
 
             if tune_msg:
                 last_tune_msg = tune_msg
 
-            # 출력
-            extra = ""
-            if last_tune_msg:
-                extra = f" |TUNE:{last_tune_msg}"
+            extra = f" |TUNE:{last_tune_msg}" if last_tune_msg else ""
 
             print(
                 f"[EP_DONE {next_log_ep:7d}/{args.episodes}] "
@@ -759,7 +797,6 @@ def main():
                         f"best_nohit_streak={best_nohit_streak}"
                     )
 
-            # ✅ 중복 로그 방지: backlog가 있어도 한 번만 찍고 다음 구간으로 점프
             next_log_ep = ((done_eps // LOG_EVERY) + 1) * LOG_EVERY
 
     print("done.")

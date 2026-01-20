@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Dict, Tuple
 
 import numpy as np
 import torch
@@ -10,6 +10,7 @@ from torch.distributions import Categorical
 from torch.optim import Adam
 
 from agent.models import ActorCritic
+
 
 @dataclass
 class PPOConfig:
@@ -29,6 +30,24 @@ class PPOConfig:
 
     rollout_steps: int = 256  # vec에선 짧게(T) + N 크게 추천
 
+    # -------------------------
+    # ✅ Adaptive LR by KL (NEW)
+    # -------------------------
+    lr_adapt: bool = True
+    target_kl: float = 0.01          # 목표 KL (PPO에서 흔한 값)
+    kl_high_mult: float = 2.0        # KL > 2*target => lr down
+    kl_low_mult: float = 0.5         # KL < 0.5*target => lr up
+    lr_down_factor: float = 0.5
+    lr_up_factor: float = 1.10
+    lr_min: float = 1e-5
+    lr_max: float = 3e-4
+
+    kl_ema_beta: float = 0.90        # KL EMA smoothing
+
+    # 너무 큰 업데이트면 epoch 조기 중단(선택)
+    early_stop_kl: bool = True
+    early_stop_kl_mult: float = 4.0  # KL > 4*target이면 epoch loop break
+
 
 class RolloutBufferVec:
     """
@@ -39,7 +58,6 @@ class RolloutBufferVec:
         self.n = int(n_envs)
         self.T = int(T)
         self.device = torch.device(device)
-
         self.reset()
 
     def reset(self):
@@ -94,6 +112,9 @@ class PPOAgentVec:
 
         self.buf = RolloutBufferVec(obs_dim, n_envs, cfg.rollout_steps, cfg.device)
 
+        # ✅ KL EMA for stable lr tuning
+        self._kl_ema = 0.0
+
     @torch.no_grad()
     def act(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -112,22 +133,59 @@ class PPOAgentVec:
     def store(self, obs, act, logp, rew, done, val):
         self.buf.add(obs, act, logp, rew, done, val)
 
-    def finish_and_update(self, last_obs: torch.Tensor, last_done: torch.Tensor):
+    def _get_lr(self) -> float:
+        return float(self.opt.param_groups[0]["lr"])
+
+    def _set_lr(self, lr: float) -> None:
+        lr = float(np.clip(lr, self.cfg.lr_min, self.cfg.lr_max))
+        for pg in self.opt.param_groups:
+            pg["lr"] = lr
+
+    @torch.no_grad()
+    def _update_lr_by_kl(self, kl_value: float) -> float:
+        """
+        KL 기반 lr 자동조절.
+        - kl이 너무 크면 lr down (업데이트 과격)
+        - kl이 너무 작으면 lr up (업데이트 약함)
+        """
+        cfg = self.cfg
+        if not cfg.lr_adapt:
+            return self._get_lr()
+
+        beta = float(cfg.kl_ema_beta)
+        self._kl_ema = beta * float(self._kl_ema) + (1.0 - beta) * float(kl_value)
+        kl = float(self._kl_ema)
+
+        lr = self._get_lr()
+        tkl = float(cfg.target_kl)
+
+        if tkl > 0.0:
+            if kl > cfg.kl_high_mult * tkl:
+                lr *= float(cfg.lr_down_factor)
+            elif kl < cfg.kl_low_mult * tkl:
+                lr *= float(cfg.lr_up_factor)
+
+        self._set_lr(lr)
+        return self._get_lr()
+
+    def finish_and_update(self, last_obs: torch.Tensor, last_done: torch.Tensor) -> Dict[str, float]:
         """
         last_obs: (N, obs_dim)
         last_done: (N,) bool
+        Returns stats for logging:
+          lr, approx_kl, entropy, pi_loss, v_loss, loss
         """
         cfg = self.cfg
 
         with torch.no_grad():
             _, last_v = self.net(last_obs)
             last_v = last_v.squeeze(-1)  # (N,)
-            # if done, bootstrap=0
             next_value = torch.where(last_done, torch.zeros_like(last_v), last_v)
 
         adv, ret = self._compute_gae(next_value)
-        self._update(adv, ret)
+        stats = self._update(adv, ret)
         self.buf.reset()
+        return stats
 
     def _compute_gae(self, next_value: torch.Tensor):
         """
@@ -156,7 +214,7 @@ class PPOAgentVec:
         adv = (adv - adv_f.mean()) / (adv_f.std(unbiased=False) + 1e-8)
         return adv, ret
 
-    def _update(self, adv: torch.Tensor, ret: torch.Tensor):
+    def _update(self, adv: torch.Tensor, ret: torch.Tensor) -> Dict[str, float]:
         cfg = self.cfg
 
         obs, act, logp_old, _, _, _ = self.buf.flatten()
@@ -166,11 +224,22 @@ class PPOAgentVec:
         n = obs.shape[0]
         idxs = np.arange(n)
 
-        for _ in range(cfg.update_epochs):
+        kl_sum = 0.0
+        ent_sum = 0.0
+        mb_count = 0
+
+        last_pi_loss = 0.0
+        last_v_loss = 0.0
+        last_loss = 0.0
+
+        for _epoch in range(int(cfg.update_epochs)):
             np.random.shuffle(idxs)
-            for start in range(0, n, cfg.minibatch_size):
-                mb = idxs[start : start + cfg.minibatch_size]
-                mb_t = torch.tensor(mb, device=self.device, dtype=torch.long)
+
+            early_stop = False
+
+            for start in range(0, n, int(cfg.minibatch_size)):
+                mb = idxs[start : start + int(cfg.minibatch_size)]
+                mb_t = torch.as_tensor(mb, device=self.device, dtype=torch.long)
 
                 obs_b = obs[mb_t]
                 act_b = act[mb_t]
@@ -181,6 +250,7 @@ class PPOAgentVec:
                 logits, v = self.net(obs_b)
                 v = v.squeeze(-1)
                 dist = Categorical(logits=logits)
+
                 logp = dist.log_prob(act_b)
                 ratio = torch.exp(logp - logp_old_b)
 
@@ -198,3 +268,40 @@ class PPOAgentVec:
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.net.parameters(), cfg.max_grad_norm)
                 self.opt.step()
+
+                with torch.no_grad():
+                    approx_kl = (logp_old_b - logp).mean()  # E[logp_old - logp_new]
+
+                kl_sum += float(approx_kl.item())
+                ent_sum += float(ent.item())
+                mb_count += 1
+
+                last_pi_loss = float(pi_loss.item())
+                last_v_loss = float(v_loss.item())
+                last_loss = float(loss.item())
+
+                # optional early stop if KL too large
+                if cfg.early_stop_kl and cfg.target_kl > 0.0:
+                    if float(approx_kl.item()) > float(cfg.early_stop_kl_mult) * float(cfg.target_kl):
+                        early_stop = True
+                        break
+
+            # epoch 끝날 때마다 mean KL 기반 lr 조절 (너무 자주 바꾸지 않음)
+            if mb_count > 0:
+                mean_kl = kl_sum / float(mb_count)
+                self._update_lr_by_kl(mean_kl)
+
+            if early_stop:
+                break
+
+        mean_kl = (kl_sum / float(mb_count)) if mb_count > 0 else 0.0
+        mean_ent = (ent_sum / float(mb_count)) if mb_count > 0 else 0.0
+
+        return {
+            "lr": self._get_lr(),
+            "approx_kl": float(mean_kl),
+            "entropy": float(mean_ent),
+            "pi_loss": float(last_pi_loss),
+            "v_loss": float(last_v_loss),
+            "loss": float(last_loss),
+        }
