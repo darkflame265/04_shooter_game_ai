@@ -30,7 +30,7 @@ class EnvConfig:
     # aim noise (keep variable, but default 0 for clean boss patterns)
     aim_noise: float = 0.0
 
-    # keep for train compatibility: used as "target/final density"
+    # "final/target" spawn (upper bound)
     spawn_rate: float = 300.0
 
     # observation
@@ -48,10 +48,11 @@ class EnvConfig:
 
     clear_bonus: float = 0.25
 
-    # Curriculum (only affects density/intensity)
+    # Curriculum (spawn_rate만 선형 증가)
     curriculum: bool = True
-    curriculum_episodes: int = 800
-    spawn_rate_start: float = 3.0  # "초기 난이도 지표" (실제 계산에 반영)
+    curriculum_episodes: int = 800  # (유지: 의미는 "몇 에피소드에 걸쳐 목표 spawn까지 가는지")
+    spawn_rate_start: float = 3.0   # 시작 spawn/s
+    spawn_rate_step: float = 0.5    # ✅ 에피소드 1회당 spawn 증가량 (너가 요청한 값)
 
     # (kept for compatibility; ignored)
     bullet_speed_start_factor: float = 1.0
@@ -60,39 +61,23 @@ class EnvConfig:
     # -------------------------
     # Boss params
     # -------------------------
-    boss_y: float = 0.92          # boss fixed Y (top area)
-    boss_x_amp: float = 0.38      # horizontal amplitude around center
-    boss_move_hz: float = 0.1    # user-controlled (NOT scaled by difficulty)
+    boss_y: float = 0.92
+    boss_x_amp: float = 0.38
+    boss_move_hz: float = 0.1
 
     # pattern
     # 0: wobble ring
     # 1: simple rotating ring
-    # 2: flower/rosette (new)
+    # 2: flower/rosette
     pattern_id: int = 2
     phase_speed0: float = 0.08
     phase_speed1: float = 0.12
 
-    # flower/rosette params (new)
-    flower_petals: int = 6            # m (number of petals)
-    flower_phase_speed: float = 0.10  # phase advance per fire (scaled by intensity slightly)
-    flower_speed_mod: float = 0.55    # speed modulation strength (0..~0.9 recommended)
-    flower_twist: float = 0.35        # adds secondary swirl (0..1)
-
-    # density mapping (deterministic)
-    intensity_gamma: float = 1.2
-    intensity_min: float = 0.25
-    intensity_max: float = 10.0
-
-    # baseline (difficulty=~1.0 기준 느낌)
-    base_rate_steps: int = 6
-    base_n0: int = 14
-    base_n1: int = 20
-
-    # clamp for safety / bullet cap
-    rate_steps_min: int = 4
-    rate_steps_max: int = 60
-    n0_max: int = 96
-    n1_max: int = 110
+    # flower/rosette params
+    flower_petals: int = 6
+    flower_phase_speed: float = 0.10
+    flower_speed_mod: float = 0.55
+    flower_twist: float = 0.35
 
     # Rendering (tkinter)
     render_size: int = 720
@@ -106,16 +91,15 @@ class VecShooterEnvTorch:
     """
     Boss-pattern simulator (Torch-only vectorized env).
 
-    Deterministic firing schedule:
-      fire every `rate_steps` steps
-      spawn exactly `n` bullets in a ring from boss position
+    ✅ NEW difficulty model:
+      - difficulty == spawn_rate (bullets/sec, float)
+      - curriculum increments spawn_rate linearly by cfg.spawn_rate_step each episode
+      - spawns are realized by accumulator: acc += spawn_rate*dt, k=floor(acc), acc-=k
 
-    Difficulty/Curriculum:
-      diff01 -> intensity -> (rate_steps down, n up, phase denser)
-      bullet speed is NOT scaled by difficulty
-
-    Added:
-      pattern_id=2: flower/rosette style (petal-like) with fully deterministic speeds.
+    This removes:
+      - diff01->intensity mapping
+      - rate_steps/n integer stepping
+      - large spawn jumps
     """
 
     ACTIONS = torch.tensor(
@@ -157,11 +141,14 @@ class VecShooterEnvTorch:
 
         self.step_count = torch.zeros((N,), device=self.device, dtype=torch.int32)
         self.t = torch.zeros((N,), device=self.device, dtype=torch.float32)
-
         self.last_hit = torch.zeros((N,), device=self.device, dtype=torch.bool)
 
         self.episode_count = torch.zeros((N,), device=self.device, dtype=torch.int32)
-        self.diff01 = torch.zeros((N,), device=self.device, dtype=torch.float32)
+
+        # ✅ current spawn_rate (bullets/sec) per env
+        self.spawn_rate_s = torch.zeros((N,), device=self.device, dtype=torch.float32)
+        # ✅ accumulator for fractional spawn
+        self.spawn_accum = torch.zeros((N,), device=self.device, dtype=torch.float32)
 
         # pattern internal phase (per env)
         self.phase = torch.zeros((N,), device=self.device, dtype=torch.float32)
@@ -171,9 +158,9 @@ class VecShooterEnvTorch:
         # obs: player(2) + player_center(2) + boss(2) + t01(1) + K*(rel(2)+vel(2))
         self.obs_dim = 2 + 2 + 2 + 1 + (cfg.obs_k * 4)
 
-        # ---- manual difficulty override (0..1)
-        self._manual_diff01 = torch.ones((N,), device=self.device, dtype=torch.float32)
-        self._manual_diff_enabled = False
+        # ---- manual spawn override
+        self._manual_spawn = torch.ones((N,), device=self.device, dtype=torch.float32) * float(cfg.spawn_rate)
+        self._manual_enabled = False
 
         # ---- render state (lazy)
         self._ui_inited = False
@@ -190,34 +177,29 @@ class VecShooterEnvTorch:
         self._trail = []
 
     # -------------------------
-    # manual difficulty API (for trainer)
+    # manual difficulty API (trainer)
     # -------------------------
-    def set_manual_difficulty(self, diff01: float, enabled: bool = True) -> None:
-        d = float(diff01)
-        if d != d:
-            d = 0.0
-        d = max(0.0, min(1.0, d))
-        self._manual_diff01.fill_(d)
-        self._manual_diff_enabled = bool(enabled)
-        self.diff01.fill_(d)
+    def set_manual_difficulty(self, spawn_rate_s: float, enabled: bool = True) -> None:
+        """
+        ✅ 이제 difficulty는 diff01이 아니라 spawn_rate (bullets/sec) 자체.
+        """
+        s = float(spawn_rate_s)
+        if s != s:
+            s = 0.0
+        s = max(0.0, min(float(self.cfg.spawn_rate), s))
+        self._manual_spawn.fill_(s)
+        self._manual_enabled = bool(enabled)
+        self.spawn_rate_s.fill_(s)
 
     def get_manual_difficulty(self) -> float:
-        return float(self._manual_diff01[0].detach().float().cpu().item())
+        return float(self._manual_spawn[0].detach().float().cpu().item())
 
     @torch.no_grad()
     def get_spawn_rate_s(self) -> float:
-        """
-        train.py가 난이도 지표로 출력/비교하는 값.
-        이 env는 Poisson이 아니라 '주기(rate_steps)마다 n발'이므로,
-        현재 diff01 기준으로 계산된 평균 bullets/sec를 반환.
-        """
-        rate_steps, n_bul = self._current_density_params()
-        dt = float(self.cfg.dt)
-        spawn = n_bul.to(torch.float32) / (rate_steps.to(torch.float32) * dt + 1e-12)
-        return float(spawn[0].detach().float().cpu().item())
+        return float(self.spawn_rate_s[0].detach().float().cpu().item())
 
     # -------------------------
-    # RNG state API (for checkpoint reproducibility)
+    # RNG state API
     # -------------------------
     def get_rng_state(self) -> Optional[torch.Tensor]:
         try:
@@ -251,6 +233,9 @@ class VecShooterEnvTorch:
         self.t[mask] = 0.0
         self.last_hit[mask] = False
 
+        # ✅ accumulator reset (에피소드마다 분수 누적 리셋)
+        self.spawn_accum[mask] = 0.0
+
         # player spawn near bottom-center-ish
         w = float(self.cfg.world_size)
         cx = 0.5 * w
@@ -260,7 +245,7 @@ class VecShooterEnvTorch:
         pos = pos.clamp(0.0, w)
         self.player_pos[mask] = pos
 
-        # phase init (keep some variety; set to 0 if you want fully identical episodes)
+        # phase init
         ph = torch.rand((int(mask.sum().item()),), device=self.device, generator=self._gen) * (2.0 * math.pi)
         self.phase[mask] = ph
 
@@ -276,7 +261,7 @@ class VecShooterEnvTorch:
             self._trail.clear()
 
         obs = self._get_obs()
-        info = {"t": self.t.clone(), "episode": self.episode_count.clone(), "diff01": self.diff01.clone()}
+        info = {"t": self.t.clone(), "episode": self.episode_count.clone(), "spawn_rate": self.spawn_rate_s.clone()}
         return obs, info
 
     @torch.no_grad()
@@ -300,7 +285,7 @@ class VecShooterEnvTorch:
 
         # ---- move boss + spawn/advance bullets
         self._advance_boss()
-        self._spawn_bullets_from_boss_deterministic()
+        self._spawn_bullets_from_boss_accum()
         self._advance_bullets()
 
         hit = self._check_hit()
@@ -348,78 +333,34 @@ class VecShooterEnvTorch:
             "hit": hit.clone(),
             "bullets": self.bul_alive.sum(dim=1).to(torch.int32),
             "episode": self.episode_count.clone(),
-            "diff01": self.diff01.clone(),
+            "spawn_rate": self.spawn_rate_s.clone(),
         }
         return obs, rew, done, info
 
     # -------------------------
-    # curriculum / difficulty
+    # curriculum / difficulty (spawn-rate only)
     # -------------------------
     def _update_curriculum(self, mask: torch.Tensor) -> None:
         cfg = self.cfg
 
-        if self._manual_diff_enabled:
-            self.diff01[mask] = self._manual_diff01[mask]
+        if self._manual_enabled:
+            self.spawn_rate_s[mask] = self._manual_spawn[mask]
             return
 
         if not cfg.curriculum:
-            self.diff01[mask] = 1.0
+            self.spawn_rate_s[mask] = float(cfg.spawn_rate)
             return
 
-        denom = max(1, int(cfg.curriculum_episodes))
-        d = (self.episode_count[mask].float() - 1.0) / float(denom)
-        self.diff01[mask] = d.clamp(0.0, 1.0)
+        # ✅ simple linear increment per episode
+        ep0 = (self.episode_count[mask].float() - 1.0).clamp_min(0.0)
+        s = float(cfg.spawn_rate_start) + ep0 * float(cfg.spawn_rate_step)
 
-    def _effective_diff01(self) -> torch.Tensor:
-        if self._manual_diff_enabled:
-            return self._manual_diff01
-        return self.diff01
-
-    @torch.no_grad()
-    def _current_intensity(self) -> torch.Tensor:
-        """
-        diff01 -> intensity (>= intensity_min)
-        - diff01이 0이어도 탄막이 아예 죽지 않게 intensity_min 적용
-        """
-        cfg = self.cfg
-        d = self._effective_diff01()
-        d5 = d * 5.0
-        gamma = float(cfg.intensity_gamma)
-        inten = torch.pow(d5.clamp_min(0.0), gamma)
-        inten = inten.clamp(float(cfg.intensity_min), float(cfg.intensity_max))
-        return inten
-
-    @torch.no_grad()
-    def _current_density_params(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns:
-          rate_steps: (N,) int64  - fire every rate_steps
-          n_bullets:  (N,) int64  - bullets per fire
-        """
-        cfg = self.cfg
-        N = self.n
-        inten = self._current_intensity()
-
-        denom = (0.15 + 0.85 * inten).clamp_min(1e-6)
-        base_rate = float(cfg.base_rate_steps)
-        rate = torch.round(base_rate / denom).to(torch.int64)
-        rate = rate.clamp(int(cfg.rate_steps_min), int(cfg.rate_steps_max))
-
-        # n = 1 + (base_n - 1) * intensity
-        if int(cfg.pattern_id) == 0:
-            base_n = float(cfg.base_n0)
-            n = torch.round(1.0 + (base_n - 1.0) * inten).to(torch.int64)
-            n = n.clamp(8, int(cfg.n0_max))
-        else:
-            base_n = float(cfg.base_n1)
-            n = torch.round(1.0 + (base_n - 1.0) * inten).to(torch.int64)
-            n = n.clamp(8, int(cfg.n1_max))
-
-        n = torch.minimum(n, torch.full((N,), int(cfg.max_bullets), device=self.device, dtype=torch.int64))
-        return rate, n
+        # ✅ "복잡한 clamp"는 안 하고, 최대치만 cfg.spawn_rate로 제한 (원하면 이 줄도 제거 가능)
+        s = s.clamp(0.0, float(cfg.spawn_rate))
+        self.spawn_rate_s[mask] = s
 
     # -------------------------
-    # boss motion (user-controlled)
+    # boss motion
     # -------------------------
     @torch.no_grad()
     def _advance_boss(self) -> None:
@@ -438,41 +379,29 @@ class VecShooterEnvTorch:
         self.boss_pos[:, 1] = y
 
     # -------------------------
-    # bullets (deterministic boss pattern)
+    # bullets spawn (accumulator-based, supports float spawn-rate)
     # -------------------------
     @torch.no_grad()
-    def _spawn_bullets_from_boss_deterministic(self) -> None:
-        """
-        Deterministic patterns:
-          pattern_id 0: wobble ring + phase increments
-          pattern_id 1: rotating ring (a0 = phase + phase_speed1*t_steps)
-          pattern_id 2: flower/rosette (petal-like) via speed modulation:
-              speed(angle) = base + mod*cos(m*angle + phase) + small swirl term
-              -> produces clear petal lobes over time (Touhou-like feel)
-
-        All bullet speeds are deterministic functions (no torch.rand).
-        """
+    def _spawn_bullets_from_boss_accum(self) -> None:
         cfg = self.cfg
         N = self.n
         B = int(cfg.max_bullets)
 
-        rate_steps, n_bul = self._current_density_params()
-
-        sc = self.step_count.to(torch.int64)
-        fire = (sc % rate_steps) == 0
-        if not torch.any(fire):
+        # acc += spawn_rate*dt, k=floor(acc)
+        self.spawn_accum += self.spawn_rate_s * float(cfg.dt)
+        k = torch.floor(self.spawn_accum).to(torch.int64)
+        if not torch.any(k > 0):
             return
+        self.spawn_accum -= k.to(torch.float32)
 
         # free slots
         free = ~self.bul_alive
         free_count = free.sum(dim=1).to(torch.int64)
-
-        n_use = torch.minimum(n_bul, free_count)
-        fire = fire & (n_use > 0)
-        if not torch.any(fire):
+        k_use = torch.minimum(k, free_count)
+        if not torch.any(k_use > 0):
             return
 
-        max_k = int(n_use[fire].max().item())
+        max_k = int(k_use.max().item())
         if max_k <= 0:
             return
 
@@ -484,19 +413,16 @@ class VecShooterEnvTorch:
         spawn_slots = free_pos[:, :max_k]  # (N, max_k)
 
         k_idx = torch.arange(max_k, device=self.device, dtype=torch.int64).view(1, max_k).expand(N, max_k)
-        do = (k_idx < n_use.view(N, 1)) & fire.view(N, 1)
+        do = (k_idx < k_use.view(N, 1))
         if not torch.any(do):
             return
 
-        # base ring angles: 2pi*(k/n)
+        # ring angles
         kf = k_idx.to(torch.float32)
-        nf = n_use.to(torch.float32).clamp_min(1.0).view(N, 1)
+        nf = k_use.to(torch.float32).clamp_min(1.0).view(N, 1)
         ang_base = (2.0 * math.pi) * (kf / nf)  # (N, max_k)
 
         t_steps = self.step_count.to(torch.float32)
-        inten = self._current_intensity()
-
-        # pattern-specific angle offset and speed
         pid = int(cfg.pattern_id)
 
         if pid == 0:
@@ -504,12 +430,10 @@ class VecShooterEnvTorch:
             a0 = a0.view(N, 1).expand(N, max_k)
             ang = a0 + ang_base
 
-            # phase increment only on fire steps
-            phase_scale = (0.60 + 0.10 * inten).clamp(0.60, 1.60)
-            phase_inc = float(cfg.phase_speed0) * phase_scale
-            self.phase = self.phase + phase_inc * fire.to(torch.float32)
+            # phase increment when bullets spawned
+            phase_inc = float(cfg.phase_speed0)
+            self.phase = self.phase + phase_inc * (k_use > 0).to(torch.float32)
 
-            # deterministic speed: interpolate by k position (no randomness)
             sp_min = float(cfg.bullet_speed_min)
             sp_max = float(cfg.bullet_speed_max)
             frac = (kf / max(1.0, float(max_k - 1))).clamp(0.0, 1.0)
@@ -520,62 +444,46 @@ class VecShooterEnvTorch:
             a0 = a0.view(N, 1).expand(N, max_k)
             ang = a0 + ang_base
 
-            # keep phase fixed (or minimal drift if you want)
             self.phase = self.phase + 0.0
 
             sp_min = float(cfg.bullet_speed_min)
             sp_max = float(cfg.bullet_speed_max)
-            # deterministic saw-like spread
             frac = ((kf * 1.6180339) % max(1.0, float(max_k))).clamp(0.0, float(max_k))
             frac = (frac / max(1.0, float(max_k - 1))).clamp(0.0, 1.0)
             spd = sp_min + (sp_max - sp_min) * frac
 
         else:
-            # -------- pattern_id == 2: flower/rosette --------
             m = max(2, int(cfg.flower_petals))
+            t2 = t_steps.view(N, 1)
 
-            # ✅ broadcast-safe time term
-            t2 = t_steps.view(N, 1)  # (N,1)
-
-            # base rotation
             a0 = self.phase.view(N, 1) + 0.02 * t2
             a0 = a0.expand(N, max_k)
 
-            # extra twist: small angular perturbation dependent on angle itself
             twist = float(cfg.flower_twist)
             ang = a0 + ang_base + twist * torch.sin(float(m) * ang_base + 0.015 * t2).to(torch.float32)
 
-            # deterministic speed modulation => petal lobes
             sp_min = float(cfg.bullet_speed_min)
             sp_max = float(cfg.bullet_speed_max)
             base = 0.5 * (sp_min + sp_max)
             amp = 0.5 * (sp_max - sp_min)
 
             mod = float(cfg.flower_speed_mod)
-            # cos(m*angle + phase) creates m petals
             ph = self.phase.view(N, 1)
             pet = torch.cos(float(m) * ang + ph)
-            # slight secondary harmonic (makes petals sharper without noise)
             pet2 = 0.35 * torch.cos(float(2 * m) * ang - 0.5 * ph)
-
-            # clamp modulation to avoid negative speeds / too wide range
             shape = (pet + pet2).clamp(-1.0, 1.0)
             spd = base + amp * (mod * shape)
             spd = spd.clamp(sp_min, sp_max)
 
-            # phase advance on fire only; slightly intensity-scaled
-            phase_scale = (0.85 + 0.06 * inten).clamp(0.85, 1.35)
-            phase_inc = float(cfg.flower_phase_speed) * phase_scale
-            self.phase = self.phase + phase_inc * fire.to(torch.float32)
+            phase_inc = float(cfg.flower_phase_speed)
+            self.phase = self.phase + phase_inc * (k_use > 0).to(torch.float32)
 
-
-        # optional small aim noise (still deterministic given RNG state)
+        # optional aim noise (uses RNG; reproducible via rng_state)
         if float(cfg.aim_noise) > 0.0:
             noise = torch.randn((N, max_k), device=self.device, generator=self._gen) * float(cfg.aim_noise)
             ang = ang + noise
 
         vel = torch.stack([torch.cos(ang), torch.sin(ang)], dim=-1) * spd.unsqueeze(-1)
-
         pos = self.boss_pos.view(N, 1, 2).expand(N, max_k, 2).contiguous()
 
         env_i = torch.arange(N, device=self.device).view(N, 1).expand(N, max_k)
@@ -716,12 +624,10 @@ class VecShooterEnvTorch:
             return x, y
 
         spawn_s = self.get_spawn_rate_s()
-        rate_steps, n_bul = self._current_density_params()
         hud_txt = (
             f"EP {int(self.episode_count[0].item())}  step {int(self.step_count[0].item())}  "
             f"t={float(self.t[0].item()):.2f}s  hit={int(self.last_hit[0].item())}\n"
-            f"bullets={int(alive0.sum().item())}  diff={float(self._effective_diff01()[0].item()):.2f}  "
-            f"spawn~={spawn_s:.2f}/s  rate={int(rate_steps[0].item())}  n={int(n_bul[0].item())}\n"
+            f"bullets={int(alive0.sum().item())}  spawn={spawn_s:.2f}/s  "
             f"boss=({float(b0[0].item()):.2f},{float(b0[1].item()):.2f})  pattern_id={int(self.cfg.pattern_id)}"
         )
         try:
@@ -729,12 +635,10 @@ class VecShooterEnvTorch:
         except Exception:
             pass
 
-        # player
         px, py = to_px_xy(p0)
         pr = max(3, int(self.cfg.player_radius / w * W))
         canvas.coords(self._item_player, px - pr, py - pr, px + pr, py + pr)
 
-        # boss
         bx, by = to_px_xy(b0)
         br0 = max(4, int(self.cfg.player_radius / w * W) + 2)
         canvas.coords(self._item_boss, bx - br0, by - br0, bx + br0, by + br0)
@@ -752,22 +656,6 @@ class VecShooterEnvTorch:
             canvas.coords(it, x - br, y - br, x + br, y + br)
             canvas.itemconfigure(it, state="normal")
 
-        if self.cfg.render_draw_trails:
-            pts = self._trail[-600:] if len(self._trail) > 0 else []
-            for it in self._item_trail:
-                canvas.itemconfigure(it, state="hidden")
-            need = max(0, len(pts) - 1)
-            while len(self._item_trail) < need:
-                self._item_trail.append(self._canvas.create_line(0, 0, 0, 0, fill="#7a7a86", width=1))
-            for k in range(need):
-                x0 = (pts[k][0] / w) * (W - 1)
-                y0 = (1.0 - pts[k][1] / w) * (W - 1)
-                x1 = (pts[k + 1][0] / w) * (W - 1)
-                y1 = (1.0 - pts[k + 1][1] / w) * (W - 1)
-                it = self._item_trail[k]
-                canvas.coords(it, x0, y0, x1, y1)
-                canvas.itemconfigure(it, state="normal")
-
         try:
             root.update()
         except Exception:
@@ -783,7 +671,7 @@ class VecShooterEnvTorch:
 
         self._tk = tk
         self._root = tk.Tk()
-        self._root.title("VecShooterEnvTorch (boss deterministic)")
+        self._root.title("VecShooterEnvTorch (spawn-rate curriculum)")
         self._root.protocol("WM_DELETE_WINDOW", self.close)
 
         W = int(self.cfg.render_size)
