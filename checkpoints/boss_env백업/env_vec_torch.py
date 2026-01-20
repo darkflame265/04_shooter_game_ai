@@ -16,7 +16,7 @@ class EnvConfig:
     max_steps: int = 60 * 60  # 60 seconds
 
     # player
-    player_speed: float = 0.3
+    player_speed: float = 0.1
     player_radius: float = 0.01
 
     # bullets (capacity)

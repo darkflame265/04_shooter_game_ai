@@ -30,10 +30,37 @@ EPS_TIE = 1e-12
 # Auto difficulty (manual diff01)
 # -------------------------
 AUTO_DIFF_ENABLED = True
-AUTO_DIFF_TARGET_HIT = 0.20     # hit_rate50 <= 0.20 이면 난이도 업
-AUTO_DIFF_STEP = 0.05           # diff01 증가폭 (0.0~1.0)
-AUTO_DIFF_COOLDOWN_LOGS = 10    # 난이도 업 후, 로그 N번은 대기
-AUTO_DIFF_MIN_READY = ROLLING_N # 최소 window 꽉 찬 뒤에만 판단
+AUTO_DIFF_TARGET_HIT = 0.20       # hit_rate50 <= 0.20 이면 난이도 업
+AUTO_DIFF_SPAWN_STEP = 5.0        # spawn을 5.0/s씩만 증가
+AUTO_DIFF_COOLDOWN_LOGS = 10      # 난이도 업 후, 로그 N번은 대기
+AUTO_DIFF_MIN_READY = ROLLING_N   # 최소 window 꽉 찬 뒤에만 판단
+
+# spawn 목표 맞추기 (diff01 탐색)
+SPAWN_MATCH_TOL = 0.25            # 목표 spawn +/- 허용 오차
+DIFF_SEARCH_ITERS = 18            # 이분탐색 반복 수 (충분)
+
+# -------------------------
+# Auto PPO tuning (target-KL + plateau)
+# -------------------------
+AUTO_TUNE_ENABLED = True
+
+# 목표 KL (PPO에서 매우 흔한 자동 lr 튜닝 기준)
+AUTO_TUNE_TARGET_KL = 0.010
+AUTO_TUNE_LR_UP = 1.10
+AUTO_TUNE_LR_DOWN = 0.50
+AUTO_TUNE_LR_MIN = 3e-5
+AUTO_TUNE_LR_MAX = 3e-4
+
+# plateau 감지 (로그 단위)
+PLATEAU_WINDOW_LOGS = 6         # 최근 로그 몇 번을 보고 정체 판단
+PLATEAU_MIN_SURV_IMPROVE = 1.0  # surv_avg50이 이 정도 이상 개선이 없으면 정체로 간주
+PLATEAU_HIT_WORSEN_EPS = 0.06   # hit_rate가 이만큼 이상 나빠지면 "불안정"으로 간주
+
+# ent_coef 조정 폭/범위
+ENT_UP = 1.35
+ENT_DOWN = 0.95
+ENT_MIN = 0.002
+ENT_MAX = 0.020
 
 
 def parse_args():
@@ -54,14 +81,10 @@ def parse_args():
 def _capture_rng_state(device: str, env: Optional[VecShooterEnvTorch] = None) -> Dict[str, Any]:
     st: Dict[str, Any] = {}
 
-    # python / numpy
     st["rng_python"] = random.getstate()
     st["rng_numpy"] = np.random.get_state()
-
-    # torch cpu
     st["rng_torch_cpu"] = torch.get_rng_state()
 
-    # torch cuda
     if device.startswith("cuda") and torch.cuda.is_available():
         try:
             st["rng_torch_cuda_all"] = torch.cuda.get_rng_state_all()
@@ -70,7 +93,6 @@ def _capture_rng_state(device: str, env: Optional[VecShooterEnvTorch] = None) ->
     else:
         st["rng_torch_cuda_all"] = None
 
-    # env internal generator
     if env is not None:
         try:
             st["rng_env_gen_state"] = env.get_rng_state()
@@ -86,7 +108,6 @@ def _restore_rng_state(st: Dict[str, Any], device: str, env: Optional[VecShooter
     if not isinstance(st, dict):
         return
 
-    # python / numpy
     try:
         if "rng_python" in st and st["rng_python"] is not None:
             random.setstate(st["rng_python"])
@@ -99,14 +120,12 @@ def _restore_rng_state(st: Dict[str, Any], device: str, env: Optional[VecShooter
     except Exception:
         pass
 
-    # torch cpu
     try:
         if "rng_torch_cpu" in st and st["rng_torch_cpu"] is not None:
             torch.set_rng_state(st["rng_torch_cpu"])
     except Exception:
         pass
 
-    # torch cuda
     if device.startswith("cuda") and torch.cuda.is_available():
         try:
             cuda_all = st.get("rng_torch_cuda_all", None)
@@ -115,7 +134,6 @@ def _restore_rng_state(st: Dict[str, Any], device: str, env: Optional[VecShooter
         except Exception:
             pass
 
-    # env internal generator
     if env is not None:
         try:
             env_state = st.get("rng_env_gen_state", None)
@@ -134,6 +152,7 @@ def _pack_checkpoint(
     manual_diff01: float,
     device: str,
     env: Optional[VecShooterEnvTorch] = None,
+    target_spawn: Optional[float] = None,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "net": agent.net.state_dict(),
@@ -142,9 +161,10 @@ def _pack_checkpoint(
         "episode": int(ep),
         "global_step": int(global_step),
         "manual_diff01": float(manual_diff01),
-        # ✅ RNG snapshot
         "rng_state": _capture_rng_state(device=device, env=env),
     }
+    if target_spawn is not None:
+        payload["target_spawn"] = float(target_spawn)
     try:
         payload["opt"] = agent.opt.state_dict()
     except Exception:
@@ -163,15 +183,15 @@ def _try_load_checkpoint(
     path: str,
     device: str,
     env: Optional[VecShooterEnvTorch] = None,
-) -> Tuple[int, int, Optional[float], Optional[Dict[str, Any]]]:
+) -> Tuple[int, int, Optional[float], Optional[Dict[str, Any]], Optional[float]]:
     if not os.path.isfile(path):
         print(f"[CKPT] no checkpoint found at {path} -> starting fresh")
-        return 1, 0, None, None
+        return 1, 0, None, None, None
 
     ckpt = torch.load(path, map_location=device, weights_only=False)
     if not (isinstance(ckpt, dict) and "net" in ckpt):
         print("[CKPT] invalid checkpoint format -> starting fresh")
-        return 1, 0, None, None
+        return 1, 0, None, None, None
 
     agent.net.load_state_dict(ckpt["net"])
     agent.net.to(device)
@@ -196,7 +216,12 @@ def _try_load_checkpoint(
     except Exception:
         manual_diff01 = None
 
-    # ✅ RNG restore (if exists)
+    target_spawn = ckpt.get("target_spawn", None)
+    try:
+        target_spawn = float(target_spawn) if target_spawn is not None else None
+    except Exception:
+        target_spawn = None
+
     rng_state = ckpt.get("rng_state", None)
     if isinstance(rng_state, dict):
         _restore_rng_state(rng_state, device=device, env=env)
@@ -205,22 +230,19 @@ def _try_load_checkpoint(
     print(f"[CKPT] loaded {path} -> resume from episode {start_ep}, global_step {global_step}")
     if manual_diff01 is not None:
         print(f"[CKPT] loaded manual_diff01={manual_diff01:.3f}")
+    if target_spawn is not None:
+        print(f"[CKPT] loaded target_spawn={target_spawn:.2f}/s")
     if isinstance(rng_state, dict):
         print("[CKPT] restored RNG state")
     else:
         print("[CKPT] no RNG state in checkpoint (old ckpt)")
 
-    return start_ep, global_step, manual_diff01, rng_state
+    return start_ep, global_step, manual_diff01, rng_state, target_spawn
 
 
 def _try_load_best_metrics(
     best_path: str, device: str
 ) -> Tuple[Optional[float], Optional[int], Optional[float], Optional[float]]:
-    """
-    returns: (best_hit_rate50, best_nohit_streak, best_avg50, best_spawn)
-      - hit_rate50: 낮을수록 좋음
-      - best_spawn: 높을수록 좋음 (난이도)
-    """
     if not os.path.isfile(best_path):
         return None, None, None, None
     try:
@@ -257,19 +279,11 @@ def _try_load_best_metrics(
 
 @torch.no_grad()
 def _render_viewer(args):
-    """
-    Performance test mode:
-      - no training
-      - loads ppo_best.pt first (best), fallback to ppo.pt
-      - uses the checkpoint's manual_diff01 if available to reproduce "best" difficulty
-      - (optional) restores rng_state so that "same sequence" replay is possible
-    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("[RENDER] device:", device)
 
     env_cfg = EnvConfig(seed=0)
-    env_cfg.curriculum = False  # render는 manual difficulty로 고정
-
+    env_cfg.curriculum = False
     env = VecShooterEnvTorch(env_cfg, n_envs=1, device=device)
 
     ppo_cfg = PPOConfig(device=device)
@@ -289,7 +303,6 @@ def _render_viewer(args):
     agent.net.to(device)
     agent.net.eval()
 
-    # (optional) restore RNG for deterministic-ish replay
     rng_state = ckpt.get("rng_state", None)
     if isinstance(rng_state, dict):
         _restore_rng_state(rng_state, device=device, env=env)
@@ -307,7 +320,6 @@ def _render_viewer(args):
     print(f"[RENDER] fixed difficulty: diff01={diff01:.2f} spawn={env.get_spawn_rate_s():.2f}/s")
 
     obs, _ = env.reset()
-
     done_eps = 0
     ep_hit = torch.zeros((1,), device=device, dtype=torch.bool)
 
@@ -340,6 +352,86 @@ def _render_viewer(args):
     print("done.")
 
 
+@torch.no_grad()
+def _spawn_from_diff(env: VecShooterEnvTorch, diff01: float) -> float:
+    env.set_manual_difficulty(float(np.clip(diff01, 0.0, 1.0)))
+    return float(env.get_spawn_rate_s())
+
+
+@torch.no_grad()
+def _find_diff_for_target_spawn(env: VecShooterEnvTorch, target_spawn: float) -> float:
+    target = float(max(0.0, target_spawn))
+
+    lo, hi = 0.0, 1.0
+    s_lo = _spawn_from_diff(env, lo)
+    s_hi = _spawn_from_diff(env, hi)
+
+    if target <= s_lo + SPAWN_MATCH_TOL:
+        return lo
+    if target >= s_hi - SPAWN_MATCH_TOL:
+        return hi
+
+    best_diff = lo
+    best_err = abs(s_lo - target)
+
+    for _ in range(int(DIFF_SEARCH_ITERS)):
+        mid = 0.5 * (lo + hi)
+        s_mid = _spawn_from_diff(env, mid)
+        err = abs(s_mid - target)
+
+        if err < best_err:
+            best_err = err
+            best_diff = mid
+
+        if s_mid >= target:
+            hi = mid
+        else:
+            lo = mid
+
+    return float(best_diff)
+
+
+def _get_opt_lr(agent: PPOAgentVec) -> float:
+    try:
+        return float(agent.opt.param_groups[0]["lr"])
+    except Exception:
+        return float("nan")
+
+
+def _set_opt_lr(agent: PPOAgentVec, lr: float) -> None:
+    try:
+        for g in agent.opt.param_groups:
+            g["lr"] = float(lr)
+    except Exception:
+        pass
+
+
+def _get_ent_coef(agent: PPOAgentVec, ppo_cfg: PPOConfig) -> float:
+    # PPOAgentVec 구현이 cfg를 참조하는지/내부 변수를 쓰는지 모르니 둘 다 대응
+    if hasattr(agent, "cfg") and hasattr(agent.cfg, "ent_coef"):
+        try:
+            return float(agent.cfg.ent_coef)
+        except Exception:
+            pass
+    try:
+        return float(ppo_cfg.ent_coef)
+    except Exception:
+        return float("nan")
+
+
+def _set_ent_coef(agent: PPOAgentVec, ppo_cfg: PPOConfig, ent: float) -> None:
+    ent = float(ent)
+    if hasattr(agent, "cfg") and hasattr(agent.cfg, "ent_coef"):
+        try:
+            agent.cfg.ent_coef = ent
+        except Exception:
+            pass
+    try:
+        ppo_cfg.ent_coef = ent
+    except Exception:
+        pass
+
+
 def main():
     args = parse_args()
     os.makedirs("checkpoints", exist_ok=True)
@@ -349,13 +441,9 @@ def main():
         _render_viewer(args)
         return
 
-    # -------------------------
-    # TRAIN MODE (vec)
-    # -------------------------
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("[DEV]", device)
 
-    # NOTE: initial seeding. If ckpt has rng_state, it will override these.
     np.random.seed(0)
     random.seed(0)
     torch.manual_seed(0)
@@ -363,32 +451,33 @@ def main():
         torch.cuda.manual_seed_all(0)
 
     env_cfg = EnvConfig(seed=0)
-    env_cfg.curriculum = False  # trainer가 manual diff01로 제어
+    env_cfg.curriculum = False
     env = VecShooterEnvTorch(env_cfg, n_envs=args.n_envs, device=device)
 
     ppo_cfg = PPOConfig(
         device=device,
-        rollout_steps=256,
-        lr=3e-4,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_ratio=0.2,
-        ent_coef=0.01,
+        rollout_steps=1024,
+        lr=1e-4,
+        gamma=0.995,
+        gae_lambda=0.97,
+        clip_ratio=0.12,
+        ent_coef=0.003,
         minibatch_size=4096,
-        update_epochs=6,
+        update_epochs=4,
     )
     agent = PPOAgentVec(obs_dim=env.obs_dim, act_dim=env.action_dim, n_envs=args.n_envs, cfg=ppo_cfg)
 
-    start_ep, global_step, ckpt_diff, _rng = _try_load_checkpoint(agent, CKPT_LATEST, device, env=env)
-
-    # ✅ 누적(글로벌) 에피소드 카운터: ckpt episode + 이번 런에서 완료한 done_eps
+    start_ep, global_step, ckpt_diff, _rng, ckpt_target_spawn = _try_load_checkpoint(agent, CKPT_LATEST, device, env=env)
     base_global_episode = int(max(0, start_ep - 1))
 
     recent_surv = deque(maxlen=ROLLING_N)
     recent_hit = deque(maxlen=ROLLING_N)
 
-    best_hit_rate, best_nohit_streak, best_avg50, best_spawn = _try_load_best_metrics(CKPT_BEST, device)
+    # plateau 판단용 로그 히스토리
+    hist_avg_surv = deque(maxlen=PLATEAU_WINDOW_LOGS)
+    hist_hit_rate = deque(maxlen=PLATEAU_WINDOW_LOGS)
 
+    best_hit_rate, best_nohit_streak, best_avg50, best_spawn = _try_load_best_metrics(CKPT_BEST, device)
     if best_hit_rate is None:
         best_hit_rate = 1e9
     if best_nohit_streak is None:
@@ -408,9 +497,11 @@ def main():
     manual_diff01 = float(np.clip(manual_diff01, 0.0, 1.0))
     env.set_manual_difficulty(manual_diff01)
 
-    diff_cooldown = 0
+    cur_spawn = float(env.get_spawn_rate_s())
+    target_spawn = float(ckpt_target_spawn) if ckpt_target_spawn is not None else cur_spawn
 
-    print(f"[DIFF] start manual_diff01={manual_diff01:.2f} spawn={env.get_spawn_rate_s():.2f}/s")
+    diff_cooldown = 0
+    print(f"[DIFF] start manual_diff01={manual_diff01:.3f} spawn={cur_spawn:.2f}/s target_spawn={target_spawn:.2f}/s")
 
     obs, _ = env.reset()
     ep_hit = torch.zeros((args.n_envs,), device=device, dtype=torch.bool)
@@ -421,6 +512,9 @@ def main():
 
     run_step0 = global_step
     t0 = time.time()
+
+    # 마지막으로 적용된 (자동 튜닝) 로그용
+    last_tune_msg = ""
 
     while done_eps < int(args.episodes):
         if esc_pressed():
@@ -437,7 +531,6 @@ def main():
 
             if torch.any(done):
                 d = done
-
                 t_done = info["t"][d].detach().float().cpu().numpy()
                 h_done = ep_hit[d].detach().float().cpu().numpy()
                 for tt, hh in zip(t_done.tolist(), h_done.tolist()):
@@ -452,12 +545,17 @@ def main():
             obs = next_obs
             global_step += int(args.n_envs)
 
-        agent.finish_and_update(
+        # --- PPO update
+        upd_stats = agent.finish_and_update(
             last_obs=obs,
             last_done=torch.zeros((args.n_envs,), device=device, dtype=torch.bool),
         )
+        # upd_stats는 None일 수도 있음 (agent_vec 구현에 따라)
 
-        while done_eps >= next_log_ep:
+        # -------------------------
+        # LOG (print ONCE)
+        # -------------------------
+        if done_eps >= next_log_ep:
             dt = max(1e-6, time.time() - t0)
             run_steps = global_step - run_step0
             sps = run_steps / dt
@@ -466,9 +564,80 @@ def main():
             hit_rate = float(np.mean(recent_hit)) if recent_hit else 0.0
             n = len(recent_hit)
 
-            spawn_s = env.get_spawn_rate_s()
-
+            spawn_s = float(env.get_spawn_rate_s())
             global_episode = base_global_episode + int(done_eps)
+
+            # 히스토리 업데이트(plateau 감지)
+            hist_avg_surv.append(avg_surv)
+            hist_hit_rate.append(hit_rate)
+
+            # -------------------------
+            # Auto PPO tuning
+            # -------------------------
+            tune_msg = ""
+            if AUTO_TUNE_ENABLED and (n >= AUTO_DIFF_MIN_READY):
+                # 1) KL 기반 lr 자동조절(가능하면)
+                approx_kl = None
+                entropy = None
+                clipfrac = None
+
+                if isinstance(upd_stats, dict):
+                    # agent_vec이 stats를 dict로 리턴하는 경우를 지원
+                    approx_kl = upd_stats.get("approx_kl", None)
+                    entropy = upd_stats.get("entropy", None)
+                    clipfrac = upd_stats.get("clipfrac", None)
+
+                # lr 조절 (KL 정보가 있을 때만)
+                if approx_kl is not None:
+                    try:
+                        kl = float(approx_kl)
+                        lr0 = _get_opt_lr(agent)
+                        lr1 = lr0
+
+                        if kl > (2.0 * AUTO_TUNE_TARGET_KL):
+                            lr1 = max(AUTO_TUNE_LR_MIN, lr0 * AUTO_TUNE_LR_DOWN)
+                            _set_opt_lr(agent, lr1)
+                            tune_msg += f" lr{lr0:.2e}->{lr1:.2e}(kl={kl:.4f})"
+                        elif kl < (0.5 * AUTO_TUNE_TARGET_KL):
+                            lr1 = min(AUTO_TUNE_LR_MAX, lr0 * AUTO_TUNE_LR_UP)
+                            _set_opt_lr(agent, lr1)
+                            tune_msg += f" lr{lr0:.2e}->{lr1:.2e}(kl={kl:.4f})"
+                    except Exception:
+                        pass
+
+                # 2) plateau 기반 ent_coef 조절 (KL 없어도 동작)
+                plateau = False
+                unstable = False
+                if len(hist_avg_surv) >= PLATEAU_WINDOW_LOGS:
+                    # surv 개선이 거의 없는지
+                    if (max(hist_avg_surv) - min(hist_avg_surv)) < PLATEAU_MIN_SURV_IMPROVE:
+                        plateau = True
+
+                    # hit_rate가 최근에 나빠지는지(불안정)
+                    if (hist_hit_rate[-1] - min(hist_hit_rate)) > PLATEAU_HIT_WORSEN_EPS:
+                        unstable = True
+
+                ent0 = _get_ent_coef(agent, ppo_cfg)
+                ent1 = ent0
+
+                if unstable:
+                    # 불안정하면 탐색/업데이트를 약간 줄이는 편이 안전
+                    ent1 = max(ENT_MIN, ent0 * ENT_DOWN)
+                elif plateau:
+                    # 정체면 탐색 늘려서 탈출 시도
+                    ent1 = min(ENT_MAX, ent0 * ENT_UP)
+
+                if abs(ent1 - ent0) > 1e-12:
+                    _set_ent_coef(agent, ppo_cfg, ent1)
+                    tune_msg += f" ent{ent0:.4f}->{ent1:.4f}"
+
+            if tune_msg:
+                last_tune_msg = tune_msg
+
+            # 출력
+            extra = ""
+            if last_tune_msg:
+                extra = f" |TUNE:{last_tune_msg}"
 
             print(
                 f"[EP_DONE {next_log_ep:7d}/{args.episodes}] "
@@ -476,6 +645,7 @@ def main():
                 f"spawn={spawn_s:5.2f}/s "
                 f"global_episode={global_episode} "
                 f"(n={n:2d}) steps={global_step} SPS={sps:7.1f}"
+                f"{extra}"
             )
 
             payload = _pack_checkpoint(
@@ -487,6 +657,7 @@ def main():
                 manual_diff01=manual_diff01,
                 device=device,
                 env=env,
+                target_spawn=target_spawn,
             )
             _save_checkpoint(payload, CKPT_LATEST)
 
@@ -497,7 +668,7 @@ def main():
                     nohit_streak = 0
 
             # -------------------------
-            # Auto difficulty update
+            # Auto difficulty update (spawn +5)
             # -------------------------
             if diff_cooldown > 0:
                 diff_cooldown -= 1
@@ -506,26 +677,37 @@ def main():
             eligible_for_diff = AUTO_DIFF_ENABLED and window_ready and (diff_cooldown == 0)
 
             if eligible_for_diff and (hit_rate <= AUTO_DIFF_TARGET_HIT + 1e-12) and (manual_diff01 < 1.0 - 1e-9):
-                old = manual_diff01
-                manual_diff01 = float(np.clip(manual_diff01 + AUTO_DIFF_STEP, 0.0, 1.0))
+                old_diff = float(manual_diff01)
+                old_spawn = float(env.get_spawn_rate_s())
+
+                target_spawn = float(target_spawn + AUTO_DIFF_SPAWN_STEP)
+
+                new_diff = _find_diff_for_target_spawn(env, target_spawn)
+                manual_diff01 = float(np.clip(new_diff, 0.0, 1.0))
                 env.set_manual_difficulty(manual_diff01)
+                new_spawn = float(env.get_spawn_rate_s())
+
                 diff_cooldown = int(AUTO_DIFF_COOLDOWN_LOGS)
 
                 print(
-                    f"[DIFF] up: {old:.2f} -> {manual_diff01:.2f}  "
+                    f"[DIFF] up(target_spawn +{AUTO_DIFF_SPAWN_STEP:.1f}): "
+                    f"diff {old_diff:.3f} -> {manual_diff01:.3f}  "
                     f"(hit_rate{ROLLING_N}={hit_rate:.3f} <= {AUTO_DIFF_TARGET_HIT:.3f})  "
-                    f"spawn={env.get_spawn_rate_s():.2f}/s"
+                    f"spawn {old_spawn:.2f} -> {new_spawn:.2f}/s  "
+                    f"target_spawn={target_spawn:.2f}/s"
                 )
 
             # -------------------------
-            # BEST selection rule (난이도 우선)
+            # BEST selection rule
             # -------------------------
+            spawn_now = float(env.get_spawn_rate_s())
+
             eligible = (next_log_ep >= BEST_MIN_EPISODES) and window_ready
             if eligible:
                 SPAWN_EPS = 1e-9
 
-                better_spawn = (spawn_s > best_spawn + SPAWN_EPS)
-                same_spawn = abs(spawn_s - best_spawn) <= SPAWN_EPS
+                better_spawn = (spawn_now > best_spawn + SPAWN_EPS)
+                same_spawn = abs(spawn_now - best_spawn) <= SPAWN_EPS
 
                 better_hit = (hit_rate < (best_hit_rate - BEST_HIT_MARGIN))
                 tied_hit = abs(hit_rate - best_hit_rate) <= EPS_TIE
@@ -550,7 +732,7 @@ def main():
                     reason = "tie: nohit_streak improved"
 
                 if should_update_best:
-                    best_spawn = float(spawn_s)
+                    best_spawn = float(spawn_now)
                     if (better_spawn or (same_spawn and better_hit)):
                         best_hit_rate = float(hit_rate)
                         best_avg50 = float(avg_surv)
@@ -565,6 +747,7 @@ def main():
                     best_payload["best_avg50"] = float(best_avg50)
                     best_payload["best_nohit_streak"] = int(best_nohit_streak)
                     best_payload["manual_diff01"] = float(manual_diff01)
+                    best_payload["target_spawn"] = float(target_spawn)
 
                     _save_checkpoint(best_payload, CKPT_BEST)
 
@@ -576,7 +759,8 @@ def main():
                         f"best_nohit_streak={best_nohit_streak}"
                     )
 
-            next_log_ep += LOG_EVERY
+            # ✅ 중복 로그 방지: backlog가 있어도 한 번만 찍고 다음 구간으로 점프
+            next_log_ep = ((done_eps // LOG_EVERY) + 1) * LOG_EVERY
 
     print("done.")
 
