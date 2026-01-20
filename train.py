@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
+import random
 from collections import deque
 from typing import Any, Dict, Tuple, Optional
 
@@ -47,6 +48,83 @@ def parse_args():
     return p.parse_args()
 
 
+# -------------------------
+# RNG helpers
+# -------------------------
+def _capture_rng_state(device: str, env: Optional[VecShooterEnvTorch] = None) -> Dict[str, Any]:
+    st: Dict[str, Any] = {}
+
+    # python / numpy
+    st["rng_python"] = random.getstate()
+    st["rng_numpy"] = np.random.get_state()
+
+    # torch cpu
+    st["rng_torch_cpu"] = torch.get_rng_state()
+
+    # torch cuda
+    if device.startswith("cuda") and torch.cuda.is_available():
+        try:
+            st["rng_torch_cuda_all"] = torch.cuda.get_rng_state_all()
+        except Exception:
+            st["rng_torch_cuda_all"] = None
+    else:
+        st["rng_torch_cuda_all"] = None
+
+    # env internal generator
+    if env is not None:
+        try:
+            st["rng_env_gen_state"] = env.get_rng_state()
+        except Exception:
+            st["rng_env_gen_state"] = None
+    else:
+        st["rng_env_gen_state"] = None
+
+    return st
+
+
+def _restore_rng_state(st: Dict[str, Any], device: str, env: Optional[VecShooterEnvTorch] = None) -> None:
+    if not isinstance(st, dict):
+        return
+
+    # python / numpy
+    try:
+        if "rng_python" in st and st["rng_python"] is not None:
+            random.setstate(st["rng_python"])
+    except Exception:
+        pass
+
+    try:
+        if "rng_numpy" in st and st["rng_numpy"] is not None:
+            np.random.set_state(st["rng_numpy"])
+    except Exception:
+        pass
+
+    # torch cpu
+    try:
+        if "rng_torch_cpu" in st and st["rng_torch_cpu"] is not None:
+            torch.set_rng_state(st["rng_torch_cpu"])
+    except Exception:
+        pass
+
+    # torch cuda
+    if device.startswith("cuda") and torch.cuda.is_available():
+        try:
+            cuda_all = st.get("rng_torch_cuda_all", None)
+            if cuda_all is not None:
+                torch.cuda.set_rng_state_all(cuda_all)
+        except Exception:
+            pass
+
+    # env internal generator
+    if env is not None:
+        try:
+            env_state = st.get("rng_env_gen_state", None)
+            if env_state is not None:
+                env.set_rng_state(env_state)
+        except Exception:
+            pass
+
+
 def _pack_checkpoint(
     agent: PPOAgentVec,
     ppo_cfg: PPOConfig,
@@ -54,6 +132,8 @@ def _pack_checkpoint(
     ep: int,
     global_step: int,
     manual_diff01: float,
+    device: str,
+    env: Optional[VecShooterEnvTorch] = None,
 ) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "net": agent.net.state_dict(),
@@ -62,6 +142,8 @@ def _pack_checkpoint(
         "episode": int(ep),
         "global_step": int(global_step),
         "manual_diff01": float(manual_diff01),
+        # ✅ RNG snapshot
+        "rng_state": _capture_rng_state(device=device, env=env),
     }
     try:
         payload["opt"] = agent.opt.state_dict()
@@ -76,15 +158,20 @@ def _save_checkpoint(payload: Dict[str, Any], path: str) -> None:
     print(f"[SAVE] {path}")
 
 
-def _try_load_checkpoint(agent: PPOAgentVec, path: str, device: str) -> Tuple[int, int, Optional[float]]:
+def _try_load_checkpoint(
+    agent: PPOAgentVec,
+    path: str,
+    device: str,
+    env: Optional[VecShooterEnvTorch] = None,
+) -> Tuple[int, int, Optional[float], Optional[Dict[str, Any]]]:
     if not os.path.isfile(path):
         print(f"[CKPT] no checkpoint found at {path} -> starting fresh")
-        return 1, 0, None
+        return 1, 0, None, None
 
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     if not (isinstance(ckpt, dict) and "net" in ckpt):
         print("[CKPT] invalid checkpoint format -> starting fresh")
-        return 1, 0, None
+        return 1, 0, None, None
 
     agent.net.load_state_dict(ckpt["net"])
     agent.net.to(device)
@@ -102,20 +189,33 @@ def _try_load_checkpoint(agent: PPOAgentVec, path: str, device: str) -> Tuple[in
 
     last_ep = int(ckpt.get("episode", 0))
     global_step = int(ckpt.get("global_step", 0))
+
     manual_diff01 = ckpt.get("manual_diff01", None)
     try:
         manual_diff01 = float(manual_diff01) if manual_diff01 is not None else None
     except Exception:
         manual_diff01 = None
 
+    # ✅ RNG restore (if exists)
+    rng_state = ckpt.get("rng_state", None)
+    if isinstance(rng_state, dict):
+        _restore_rng_state(rng_state, device=device, env=env)
+
     start_ep = last_ep + 1
     print(f"[CKPT] loaded {path} -> resume from episode {start_ep}, global_step {global_step}")
     if manual_diff01 is not None:
         print(f"[CKPT] loaded manual_diff01={manual_diff01:.3f}")
-    return start_ep, global_step, manual_diff01
+    if isinstance(rng_state, dict):
+        print("[CKPT] restored RNG state")
+    else:
+        print("[CKPT] no RNG state in checkpoint (old ckpt)")
+
+    return start_ep, global_step, manual_diff01, rng_state
 
 
-def _try_load_best_metrics(best_path: str, device: str) -> Tuple[Optional[float], Optional[int], Optional[float], Optional[float]]:
+def _try_load_best_metrics(
+    best_path: str, device: str
+) -> Tuple[Optional[float], Optional[int], Optional[float], Optional[float]]:
     """
     returns: (best_hit_rate50, best_nohit_streak, best_avg50, best_spawn)
       - hit_rate50: 낮을수록 좋음
@@ -124,7 +224,7 @@ def _try_load_best_metrics(best_path: str, device: str) -> Tuple[Optional[float]
     if not os.path.isfile(best_path):
         return None, None, None, None
     try:
-        ckpt = torch.load(best_path, map_location=device)
+        ckpt = torch.load(best_path, map_location=device, weights_only=False)
     except Exception:
         return None, None, None, None
     if not isinstance(ckpt, dict):
@@ -162,6 +262,7 @@ def _render_viewer(args):
       - no training
       - loads ppo_best.pt first (best), fallback to ppo.pt
       - uses the checkpoint's manual_diff01 if available to reproduce "best" difficulty
+      - (optional) restores rng_state so that "same sequence" replay is possible
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("[RENDER] device:", device)
@@ -179,7 +280,7 @@ def _render_viewer(args):
         print(f"[RENDER] checkpoint not found: {CKPT_BEST} or {CKPT_LATEST}")
         return
 
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     if not (isinstance(ckpt, dict) and "net" in ckpt):
         print("[RENDER] invalid checkpoint format")
         return
@@ -187,6 +288,12 @@ def _render_viewer(args):
     agent.net.load_state_dict(ckpt["net"])
     agent.net.to(device)
     agent.net.eval()
+
+    # (optional) restore RNG for deterministic-ish replay
+    rng_state = ckpt.get("rng_state", None)
+    if isinstance(rng_state, dict):
+        _restore_rng_state(rng_state, device=device, env=env)
+        print("[RENDER] restored RNG state from checkpoint")
 
     diff01 = ckpt.get("manual_diff01", None)
     try:
@@ -248,8 +355,12 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("[DEV]", device)
 
+    # NOTE: initial seeding. If ckpt has rng_state, it will override these.
     np.random.seed(0)
+    random.seed(0)
     torch.manual_seed(0)
+    if device.startswith("cuda") and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(0)
 
     env_cfg = EnvConfig(seed=0)
     env_cfg.curriculum = False  # trainer가 manual diff01로 제어
@@ -268,10 +379,9 @@ def main():
     )
     agent = PPOAgentVec(obs_dim=env.obs_dim, act_dim=env.action_dim, n_envs=args.n_envs, cfg=ppo_cfg)
 
-    start_ep, global_step, ckpt_diff = _try_load_checkpoint(agent, CKPT_LATEST, device)
+    start_ep, global_step, ckpt_diff, _rng = _try_load_checkpoint(agent, CKPT_LATEST, device, env=env)
 
     # ✅ 누적(글로벌) 에피소드 카운터: ckpt episode + 이번 런에서 완료한 done_eps
-    # start_ep는 "다음 에피소드 번호"이므로, 지금까지 완료된 누적은 start_ep-1
     base_global_episode = int(max(0, start_ep - 1))
 
     recent_surv = deque(maxlen=ROLLING_N)
@@ -358,7 +468,6 @@ def main():
 
             spawn_s = env.get_spawn_rate_s()
 
-            # ✅ 글로벌 누적 에피소드 수
             global_episode = base_global_episode + int(done_eps)
 
             print(
@@ -369,7 +478,16 @@ def main():
                 f"(n={n:2d}) steps={global_step} SPS={sps:7.1f}"
             )
 
-            payload = _pack_checkpoint(agent, ppo_cfg, env_cfg, next_log_ep, global_step, manual_diff01)
+            payload = _pack_checkpoint(
+                agent=agent,
+                ppo_cfg=ppo_cfg,
+                env_cfg=env_cfg,
+                ep=next_log_ep,
+                global_step=global_step,
+                manual_diff01=manual_diff01,
+                device=device,
+                env=env,
+            )
             _save_checkpoint(payload, CKPT_LATEST)
 
             if len(recent_hit) > 0:
