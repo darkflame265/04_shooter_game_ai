@@ -40,8 +40,8 @@ class EnvConfig:
     wall_penalty: float = 0.002
 
     near_miss_enabled: bool = True
-    near_miss_margin: float = 0.020
-    near_miss_coef: float = 0.010
+    near_miss_margin: float = 0.03
+    near_miss_coef: float = 0.05
 
     clear_bonus: float = 0.25
 

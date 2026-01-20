@@ -17,11 +17,11 @@ from esc_exit import esc_pressed
 CKPT_LATEST = "checkpoints/ppo.pt"
 CKPT_BEST = "checkpoints/ppo_best.pt"
 
-LOG_EVERY = 20
+LOG_EVERY = 50
 ROLLING_N = 50
 BEST_MIN_EPISODES = 200
 
-# Best 갱신 보수적으로: hit_rate 개선 최소 폭
+# Best 갱신 보수적으로: hit_rate 개선 최소 폭 (낮을수록 좋음)
 BEST_HIT_MARGIN = 1e-3
 EPS_TIE = 1e-12
 
@@ -29,18 +29,21 @@ EPS_TIE = 1e-12
 # Auto difficulty (manual diff01)
 # -------------------------
 AUTO_DIFF_ENABLED = True
-AUTO_DIFF_TARGET_HIT = 0.05     # hit_rate50 <= 0.05 이면 난이도 업
-AUTO_DIFF_STEP = 0.10           # diff01 증가폭 (0.0~1.0)
-AUTO_DIFF_COOLDOWN_LOGS = 3     # 난이도 업 후, 로그 N번은 대기 (너무 빨리 상승 방지)
+AUTO_DIFF_TARGET_HIT = 0.20     # hit_rate50 <= 0.20 이면 난이도 업
+AUTO_DIFF_STEP = 0.05           # diff01 증가폭 (0.0~1.0)
+AUTO_DIFF_COOLDOWN_LOGS = 10    # 난이도 업 후, 로그 N번은 대기
 AUTO_DIFF_MIN_READY = ROLLING_N # 최소 window 꽉 찬 뒤에만 판단
 
 
 def parse_args():
-    p = argparse.ArgumentParser("shooter_game_ai - PPO trainer/eval (vec-gpu)")
-    p.add_argument("--episodes", type=int, default=20000, help="how many episode terminations to process")
-    p.add_argument("--no-render", action="store_true", help="training mode (vec env). if omitted => render-only viewer mode")
-    p.add_argument("--eval", action="store_true", help="eval mode uses ppo_best.pt (runs vec env, no tkinter)")
-    p.add_argument("--n-envs", type=int, default=256, help="number of parallel envs on GPU (training/eval only)")
+    p = argparse.ArgumentParser("shooter_game_ai - PPO trainer (vec-gpu)")
+    p.add_argument("--episodes", type=int, default=20000, help="how many episode terminations to process / render")
+    p.add_argument(
+        "--no-render",
+        action="store_true",
+        help="training mode (vec env). if omitted => render-only performance test mode",
+    )
+    p.add_argument("--n-envs", type=int, default=256, help="number of parallel envs on GPU (training only)")
     return p.parse_args()
 
 
@@ -112,22 +115,25 @@ def _try_load_checkpoint(agent: PPOAgentVec, path: str, device: str) -> Tuple[in
     return start_ep, global_step, manual_diff01
 
 
-def _try_load_best_metrics(best_path: str, device: str) -> Tuple[Optional[float], Optional[int], Optional[float]]:
+def _try_load_best_metrics(best_path: str, device: str) -> Tuple[Optional[float], Optional[int], Optional[float], Optional[float]]:
     """
-    returns: (best_hit_rate50, best_nohit_streak, best_avg50)
+    returns: (best_hit_rate50, best_nohit_streak, best_avg50, best_spawn)
+      - hit_rate50: 낮을수록 좋음
+      - best_spawn: 높을수록 좋음 (난이도)
     """
     if not os.path.isfile(best_path):
-        return None, None, None
+        return None, None, None, None
     try:
         ckpt = torch.load(best_path, map_location=device)
     except Exception:
-        return None, None, None
+        return None, None, None, None
     if not isinstance(ckpt, dict):
-        return None, None, None
+        return None, None, None, None
 
     bhr = ckpt.get("best_hit_rate50", None)
     bns = ckpt.get("best_nohit_streak", None)
     bav = ckpt.get("best_avg50", None)
+    bsp = ckpt.get("best_spawn", None)
 
     try:
         bhr = float(bhr) if bhr is not None else None
@@ -141,76 +147,28 @@ def _try_load_best_metrics(best_path: str, device: str) -> Tuple[Optional[float]
         bav = float(bav) if bav is not None else None
     except Exception:
         bav = None
+    try:
+        bsp = float(bsp) if bsp is not None else None
+    except Exception:
+        bsp = None
 
-    return bhr, bns, bav
-
-
-@torch.no_grad()
-def _eval_vec(args):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    env_cfg = EnvConfig(seed=0)
-    env = VecShooterEnvTorch(env_cfg, n_envs=args.n_envs, device=device)
-
-    ppo_cfg = PPOConfig(device=device)
-    agent = PPOAgentVec(obs_dim=env.obs_dim, act_dim=env.action_dim, n_envs=args.n_envs, cfg=ppo_cfg)
-
-    if not os.path.isfile(CKPT_BEST):
-        print(f"[EVAL] best checkpoint not found: {CKPT_BEST}")
-        return
-
-    ckpt = torch.load(CKPT_BEST, map_location=device)
-    agent.net.load_state_dict(ckpt["net"])
-    agent.net.to(device)
-    agent.net.eval()
-
-    obs, _ = env.reset()
-
-    done_eps = 0
-    next_log_ep = LOG_EVERY
-
-    survs = []
-    hits = []
-    ep_hit = torch.zeros((args.n_envs,), device=device, dtype=torch.bool)
-
-    while done_eps < int(args.episodes):
-        if esc_pressed():
-            print("[EXIT] ESC pressed -> stopping eval")
-            break
-
-        a, _, _ = agent.act(obs)
-        obs, rew, done, info = env.step(a)
-
-        ep_hit = ep_hit | info["hit"]
-
-        if torch.any(done):
-            d = done
-            t_done = info["t"][d].detach().float().cpu().numpy()
-            h_done = ep_hit[d].detach().float().cpu().numpy()
-            survs.extend(t_done.tolist())
-            hits.extend(h_done.tolist())
-            done_eps += int(d.sum().item())
-
-            obs_reset, _ = env.reset(mask=d)
-            obs[d] = obs_reset[d]
-            ep_hit[d] = False
-
-        while done_eps >= next_log_ep:
-            avg_surv = float(np.mean(survs[-ROLLING_N:])) if survs else 0.0
-            hit_rate = float(np.mean(hits[-ROLLING_N:])) if hits else 0.0
-            print(f"[EVAL EP {next_log_ep:7d}] survival_avg{ROLLING_N}={avg_surv:6.2f}s hit_rate{ROLLING_N}={hit_rate:4.2f}")
-            next_log_ep += LOG_EVERY
-
-    avg_surv = float(np.mean(survs)) if survs else 0.0
-    hit_rate = float(np.mean(hits)) if hits else 0.0
-    print(f"[EVAL DONE] episodes={len(survs)} avg_survival={avg_surv:.3f}s hit_rate={hit_rate:.3f}")
+    return bhr, bns, bav, bsp
 
 
 @torch.no_grad()
 def _render_viewer(args):
+    """
+    Performance test mode:
+      - no training
+      - loads ppo_best.pt first (best), fallback to ppo.pt
+      - uses the checkpoint's manual_diff01 if available to reproduce "best" difficulty
+    """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("[RENDER] device:", device)
 
     env_cfg = EnvConfig(seed=0)
+    env_cfg.curriculum = False  # render는 manual difficulty로 고정
+
     env = VecShooterEnvTorch(env_cfg, n_envs=1, device=device)
 
     ppo_cfg = PPOConfig(device=device)
@@ -230,7 +188,16 @@ def _render_viewer(args):
     agent.net.to(device)
     agent.net.eval()
 
+    diff01 = ckpt.get("manual_diff01", None)
+    try:
+        diff01 = float(diff01) if diff01 is not None else 1.0
+    except Exception:
+        diff01 = 1.0
+    diff01 = float(np.clip(diff01, 0.0, 1.0))
+    env.set_manual_difficulty(diff01)
+
     print(f"[RENDER] loaded: {ckpt_path}")
+    print(f"[RENDER] fixed difficulty: diff01={diff01:.2f} spawn={env.get_spawn_rate_s():.2f}/s")
 
     obs, _ = env.reset()
 
@@ -244,7 +211,6 @@ def _render_viewer(args):
 
         a, _, _ = agent.act(obs)
         obs, rew, done, info = env.step(a)
-
         ep_hit = ep_hit | info["hit"]
 
         env.render()
@@ -271,12 +237,9 @@ def main():
     args = parse_args()
     os.makedirs("checkpoints", exist_ok=True)
 
-    if not args.no_render and not args.eval:
+    # render-only mode
+    if not args.no_render:
         _render_viewer(args)
-        return
-
-    if args.eval:
-        _eval_vec(args)
         return
 
     # -------------------------
@@ -288,10 +251,8 @@ def main():
     np.random.seed(0)
     torch.manual_seed(0)
 
-    # ✅ episode 기반 커리큘럼은 끄고, trainer가 manual diff01로 제어
     env_cfg = EnvConfig(seed=0)
-    env_cfg.curriculum = False
-
+    env_cfg.curriculum = False  # trainer가 manual diff01로 제어
     env = VecShooterEnvTorch(env_cfg, n_envs=args.n_envs, device=device)
 
     ppo_cfg = PPOConfig(
@@ -309,30 +270,35 @@ def main():
 
     start_ep, global_step, ckpt_diff = _try_load_checkpoint(agent, CKPT_LATEST, device)
 
+    # ✅ 누적(글로벌) 에피소드 카운터: ckpt episode + 이번 런에서 완료한 done_eps
+    # start_ep는 "다음 에피소드 번호"이므로, 지금까지 완료된 누적은 start_ep-1
+    base_global_episode = int(max(0, start_ep - 1))
+
     recent_surv = deque(maxlen=ROLLING_N)
     recent_hit = deque(maxlen=ROLLING_N)
 
-    best_hit_rate, best_nohit_streak, best_avg50 = _try_load_best_metrics(CKPT_BEST, device)
+    best_hit_rate, best_nohit_streak, best_avg50, best_spawn = _try_load_best_metrics(CKPT_BEST, device)
+
     if best_hit_rate is None:
         best_hit_rate = 1e9
     if best_nohit_streak is None:
         best_nohit_streak = 0
     if best_avg50 is None:
         best_avg50 = 0.0
+    if best_spawn is None:
+        best_spawn = -1.0
 
     print(
-        f"[BEST] best_hit_rate{ROLLING_N}(current)={best_hit_rate:.4f} "
-        f"best_avg{ROLLING_N}={best_avg50:.2f}s best_nohit_streak={best_nohit_streak} best_path={CKPT_BEST}"
+        f"[BEST] best_spawn={best_spawn:.2f}/s "
+        f"best_hit_rate{ROLLING_N}={best_hit_rate:.4f} best_avg{ROLLING_N}={best_avg50:.2f}s "
+        f"best_nohit_streak={best_nohit_streak} best_path={CKPT_BEST}"
     )
 
-    # -------------------------
-    # ✅ manual difficulty state (0..1)
-    # -------------------------
     manual_diff01 = float(ckpt_diff) if ckpt_diff is not None else 0.0
     manual_diff01 = float(np.clip(manual_diff01, 0.0, 1.0))
     env.set_manual_difficulty(manual_diff01)
 
-    diff_cooldown = 0  # log-iteration based cooldown
+    diff_cooldown = 0
 
     print(f"[DIFF] start manual_diff01={manual_diff01:.2f} spawn={env.get_spawn_rate_s():.2f}/s")
 
@@ -390,20 +356,22 @@ def main():
             hit_rate = float(np.mean(recent_hit)) if recent_hit else 0.0
             n = len(recent_hit)
 
-            # ✅ 현재 초당 총알 생성수(난이도)
             spawn_s = env.get_spawn_rate_s()
+
+            # ✅ 글로벌 누적 에피소드 수
+            global_episode = base_global_episode + int(done_eps)
 
             print(
                 f"[EP_DONE {next_log_ep:7d}/{args.episodes}] "
-                f"survival_avg{ROLLING_N}={avg_surv:6.2f}s hit_rate{ROLLING_N}={hit_rate:5.3f} "
-                f"spawn={spawn_s:6.2f}/s "
+                f"surv_avg{ROLLING_N}={avg_surv:5.2f}s hit_rate{ROLLING_N}={hit_rate:5.3f} "
+                f"spawn={spawn_s:5.2f}/s "
+                f"global_episode={global_episode} "
                 f"(n={n:2d}) steps={global_step} SPS={sps:7.1f}"
             )
 
             payload = _pack_checkpoint(agent, ppo_cfg, env_cfg, next_log_ep, global_step, manual_diff01)
             _save_checkpoint(payload, CKPT_LATEST)
 
-            # nohit_streak 업데이트는 "가장 최근 종료한 에피소드" 기준
             if len(recent_hit) > 0:
                 if recent_hit[-1] == 0.0:
                     nohit_streak += 1
@@ -411,7 +379,7 @@ def main():
                     nohit_streak = 0
 
             # -------------------------
-            # ✅ Auto difficulty update
+            # Auto difficulty update
             # -------------------------
             if diff_cooldown > 0:
                 diff_cooldown -= 1
@@ -419,7 +387,6 @@ def main():
             window_ready = (n >= AUTO_DIFF_MIN_READY)
             eligible_for_diff = AUTO_DIFF_ENABLED and window_ready and (diff_cooldown == 0)
 
-            # 조건: hit_rate50 <= 0.05 -> 다음 난이도 (diff01 step 업)
             if eligible_for_diff and (hit_rate <= AUTO_DIFF_TARGET_HIT + 1e-12) and (manual_diff01 < 1.0 - 1e-9):
                 old = manual_diff01
                 manual_diff01 = float(np.clip(manual_diff01 + AUTO_DIFF_STEP, 0.0, 1.0))
@@ -433,40 +400,62 @@ def main():
                 )
 
             # -------------------------
-            # ✅ BEST 갱신 조건 강화 (그대로)
+            # BEST selection rule (난이도 우선)
             # -------------------------
             eligible = (next_log_ep >= BEST_MIN_EPISODES) and window_ready
+            if eligible:
+                SPAWN_EPS = 1e-9
 
-            improved = eligible and (hit_rate <= (best_hit_rate - BEST_HIT_MARGIN))
+                better_spawn = (spawn_s > best_spawn + SPAWN_EPS)
+                same_spawn = abs(spawn_s - best_spawn) <= SPAWN_EPS
 
-            tied = abs(hit_rate - best_hit_rate) <= EPS_TIE
-            tie_surv_improved = eligible and tied and (avg_surv > best_avg50 + 1e-9)
-            tie_streak_improved = eligible and tied and (nohit_streak > best_nohit_streak)
+                better_hit = (hit_rate < (best_hit_rate - BEST_HIT_MARGIN))
+                tied_hit = abs(hit_rate - best_hit_rate) <= EPS_TIE
 
-            if improved or tie_surv_improved or tie_streak_improved:
-                if improved:
-                    best_hit_rate = hit_rate
-                best_avg50 = max(best_avg50, avg_surv) if tied and not improved else avg_surv
-                best_nohit_streak = max(best_nohit_streak, int(nohit_streak)) if tied and not improved else int(nohit_streak)
+                tie_surv_improved = same_spawn and tied_hit and (avg_surv > best_avg50 + 1e-9)
+                tie_streak_improved = same_spawn and tied_hit and (nohit_streak > best_nohit_streak)
 
-                best_payload = dict(payload)
-                best_payload["best_hit_rate50"] = float(best_hit_rate)
-                best_payload["best_avg50"] = float(best_avg50)
-                best_payload["best_nohit_streak"] = int(best_nohit_streak)
-                best_payload["manual_diff01"] = float(manual_diff01)  # 참고용(선택)
+                should_update_best = False
+                reason = ""
 
-                _save_checkpoint(best_payload, CKPT_BEST)
+                if better_spawn:
+                    should_update_best = True
+                    reason = "spawn increased"
+                elif same_spawn and better_hit:
+                    should_update_best = True
+                    reason = "hit_rate improved (lower)"
+                elif tie_surv_improved:
+                    should_update_best = True
+                    reason = "tie: avg_survival improved"
+                elif tie_streak_improved:
+                    should_update_best = True
+                    reason = "tie: nohit_streak improved"
 
-                if improved:
+                if should_update_best:
+                    best_spawn = float(spawn_s)
+                    if (better_spawn or (same_spawn and better_hit)):
+                        best_hit_rate = float(hit_rate)
+                        best_avg50 = float(avg_surv)
+                        best_nohit_streak = int(nohit_streak)
+                    else:
+                        best_avg50 = max(best_avg50, float(avg_surv))
+                        best_nohit_streak = max(best_nohit_streak, int(nohit_streak))
+
+                    best_payload = dict(payload)
+                    best_payload["best_spawn"] = float(best_spawn)
+                    best_payload["best_hit_rate50"] = float(best_hit_rate)
+                    best_payload["best_avg50"] = float(best_avg50)
+                    best_payload["best_nohit_streak"] = int(best_nohit_streak)
+                    best_payload["manual_diff01"] = float(manual_diff01)
+
+                    _save_checkpoint(best_payload, CKPT_BEST)
+
                     print(
-                        f"[BEST] updated best_hit_rate{ROLLING_N}={best_hit_rate:.4f} "
-                        f"best_avg{ROLLING_N}={best_avg50:.2f}s (best_nohit_streak={best_nohit_streak})"
-                    )
-                else:
-                    reason = "avg_survival improved" if tie_surv_improved else "nohit_streak improved"
-                    print(
-                        f"[BEST] overwritten (tie) hit_rate{ROLLING_N}={best_hit_rate:.4f} "
-                        f"with {reason}: best_avg{ROLLING_N}={best_avg50:.2f}s best_nohit_streak={best_nohit_streak}"
+                        f"[BEST] updated ({reason}) "
+                        f"best_spawn={best_spawn:.2f}/s "
+                        f"best_hit_rate{ROLLING_N}={best_hit_rate:.4f} "
+                        f"best_avg{ROLLING_N}={best_avg50:.2f}s "
+                        f"best_nohit_streak={best_nohit_streak}"
                     )
 
             next_log_ep += LOG_EVERY
