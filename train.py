@@ -23,37 +23,23 @@ ROLLING_N = 50
 BEST_MIN_EPISODES = 200
 
 # -------------------------
-# Auto difficulty (spawn-rate)  ✅ spawn을 +5.0/s씩 올림
+# Auto difficulty (spawn-rate): spawn을 +5.0/s씩 올림
 # -------------------------
 AUTO_DIFF_ENABLED = True
-AUTO_DIFF_TARGET_HIT = 0.20
+AUTO_DIFF_TARGET_HIT = 0.20          # ✅ 여기서는 "death_rate(=hit_end_rate)" 기준으로 사용
 AUTO_DIFF_STEP_SPAWN = 5.0
 AUTO_DIFF_COOLDOWN_LOGS = 1
 AUTO_DIFF_MIN_READY = ROLLING_N
 
-# -------------------------
-# Auto ENT tuning only
-# -------------------------
-AUTO_ENT_ENABLED = True
-
-PLATEAU_WINDOW_LOGS = 6
-PLATEAU_MIN_SURV_IMPROVE = 1.0
-
-HIT_IMPROVE_EPS = 0.03
-HIT_WORSEN_EPS = 0.03
-
-ENT_UP = 1.01
-ENT_DOWN = 0.995
-ENT_MIN = 0.003
-ENT_MAX = 0.100
-
-EPS_TIE = 1e-12
+# ✅ 난이도 상승 “연속 통과” (편법/운 통과 방지)
+DIFF_PASS_STREAK_REQ = 3  # death_rate 조건을 3번 연속 만족해야 up
 
 # -------------------------
 # BEST rule
 # -------------------------
-BEST_SPAWN_EPS = 1e-6        # spawn 동률 판단 오차
-BEST_HIT_MARGIN = 1e-6       # hit_rate 개선 최소 폭(너무 작은 흔들림 방지)
+BEST_SPAWN_EPS = 1e-6
+BEST_HIT_MARGIN = 1e-6
+EPS_TIE = 1e-12
 
 
 def parse_args():
@@ -101,19 +87,19 @@ def _restore_rng_state(st: Dict[str, Any], device: str, env: Optional[VecShooter
         return
 
     try:
-        if "rng_python" in st and st["rng_python"] is not None:
+        if st.get("rng_python", None) is not None:
             random.setstate(st["rng_python"])
     except Exception:
         pass
 
     try:
-        if "rng_numpy" in st and st["rng_numpy"] is not None:
+        if st.get("rng_numpy", None) is not None:
             np.random.set_state(st["rng_numpy"])
     except Exception:
         pass
 
     try:
-        if "rng_torch_cpu" in st and st["rng_torch_cpu"] is not None:
+        if st.get("rng_torch_cpu", None) is not None:
             torch.set_rng_state(st["rng_torch_cpu"])
     except Exception:
         pass
@@ -223,7 +209,7 @@ def _try_load_checkpoint(
 
 def _try_load_best_metrics(best_path: str, device: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
     """
-    Returns: (best_spawn, best_hit_rate50, best_avg50)
+    Returns: (best_spawn, best_death_rate50, best_avg50)
     """
     if not os.path.isfile(best_path):
         return None, None, None
@@ -235,7 +221,7 @@ def _try_load_best_metrics(best_path: str, device: str) -> Tuple[Optional[float]
         return None, None, None
 
     bs = ckpt.get("best_spawn", ckpt.get("manual_spawn", None))
-    bhr = ckpt.get("best_hit_rate50", None)
+    bdr = ckpt.get("best_hit_rate50", ckpt.get("best_death_rate50", None))
     bav = ckpt.get("best_avg50", None)
 
     try:
@@ -243,15 +229,15 @@ def _try_load_best_metrics(best_path: str, device: str) -> Tuple[Optional[float]
     except Exception:
         bs = None
     try:
-        bhr = float(bhr) if bhr is not None else None
+        bdr = float(bdr) if bdr is not None else None
     except Exception:
-        bhr = None
+        bdr = None
     try:
         bav = float(bav) if bav is not None else None
     except Exception:
         bav = None
 
-    return bs, bhr, bav
+    return bs, bdr, bav
 
 
 @torch.no_grad()
@@ -285,7 +271,6 @@ def _render_viewer(args):
         _restore_rng_state(rng_state, device=device, env=env)
         print("[RENDER] restored RNG state from checkpoint")
 
-    # ✅ manual_spawn 우선
     spawn = ckpt.get("manual_spawn", None)
     if spawn is None:
         spawn = float(env_cfg.spawn_rate_start)
@@ -305,7 +290,6 @@ def _render_viewer(args):
 
     obs, _ = env.reset()
     done_eps = 0
-    ep_hit = torch.zeros((1,), device=device, dtype=torch.bool)
 
     while done_eps < int(args.episodes):
         if esc_pressed():
@@ -313,18 +297,16 @@ def _render_viewer(args):
             break
 
         a, _, _ = agent.act(obs)
-        obs, rew, done, info = env.step(a)
-        ep_hit = ep_hit | info["hit"]
+        obs, _, done, info = env.step(a)
 
         env.render()
 
         if bool(done.item()):
             done_eps += 1
             t_done = float(info["t"][0].item())
-            h_done = int(ep_hit[0].item())
-            print(f"[RENDER EP {done_eps:6d}] survival={t_done:6.2f}s hit={h_done}")
+            h_done = int(info["hit"][0].item())  # 이 env에서는 done step의 hit가 곧 death 여부
+            print(f"[RENDER EP {done_eps:6d}] survival={t_done:6.2f}s death={h_done}")
             obs, _ = env.reset(mask=done)
-            ep_hit[0] = False
 
         time.sleep(0.001)
 
@@ -334,31 +316,6 @@ def _render_viewer(args):
         pass
 
     print("done.")
-
-
-def _get_ent_coef(agent: PPOAgentVec, ppo_cfg: PPOConfig) -> float:
-    if hasattr(agent, "cfg") and hasattr(agent.cfg, "ent_coef"):
-        try:
-            return float(agent.cfg.ent_coef)
-        except Exception:
-            pass
-    try:
-        return float(ppo_cfg.ent_coef)
-    except Exception:
-        return float("nan")
-
-
-def _set_ent_coef(agent: PPOAgentVec, ppo_cfg: PPOConfig, ent: float) -> None:
-    ent = float(ent)
-    if hasattr(agent, "cfg") and hasattr(agent.cfg, "ent_coef"):
-        try:
-            agent.cfg.ent_coef = ent
-        except Exception:
-            pass
-    try:
-        ppo_cfg.ent_coef = ent
-    except Exception:
-        pass
 
 
 def main():
@@ -399,23 +356,20 @@ def main():
     base_global_episode = int(max(0, start_ep - 1))
 
     recent_surv = deque(maxlen=ROLLING_N)
-    recent_hit = deque(maxlen=ROLLING_N)
+    recent_death_end = deque(maxlen=ROLLING_N)   # ✅ hit로 끝났는지(=death)
+    recent_clear_end = deque(maxlen=ROLLING_N)   # ✅ hit가 아니면 timeout(clear)로 간주
 
-    hist_avg_surv = deque(maxlen=PLATEAU_WINDOW_LOGS)
-    hist_hit_rate = deque(maxlen=PLATEAU_WINDOW_LOGS)
-
-    # BEST metrics load
-    best_spawn, best_hit_rate, best_avg50 = _try_load_best_metrics(CKPT_BEST, device)
+    best_spawn, best_death_rate, best_avg50 = _try_load_best_metrics(CKPT_BEST, device)
     if best_spawn is None:
         best_spawn = -1.0
-    if best_hit_rate is None:
-        best_hit_rate = 1e9
+    if best_death_rate is None:
+        best_death_rate = 1e9
     if best_avg50 is None:
         best_avg50 = 0.0
 
     print(
         f"[BEST] best_spawn={best_spawn:.2f}/s "
-        f"best_hit_rate{ROLLING_N}={best_hit_rate:.4f} best_avg{ROLLING_N}={best_avg50:.2f}s "
+        f"best_death_rate{ROLLING_N}={best_death_rate:.4f} best_avg{ROLLING_N}={best_avg50:.2f}s "
         f"best_path={CKPT_BEST}"
     )
 
@@ -424,18 +378,16 @@ def main():
     env.set_manual_difficulty(manual_spawn, enabled=True)
 
     diff_cooldown = 0
+    diff_pass_streak = 0
     print(f"[DIFF] start spawn={env.get_spawn_rate_s():.2f}/s (step={AUTO_DIFF_STEP_SPAWN:.2f}/s)")
 
     obs, _ = env.reset()
-    ep_hit = torch.zeros((args.n_envs,), device=device, dtype=torch.bool)
 
     done_eps = 0
     next_log_ep = LOG_EVERY
 
     run_step0 = global_step
     t0 = time.time()
-
-    last_ent_msg = ""
 
     while done_eps < int(args.episodes):
         if esc_pressed():
@@ -448,25 +400,33 @@ def main():
             next_obs, rew, done, info = env.step(a)
 
             agent.store(obs, a, logp, rew, done, v)
-            ep_hit = ep_hit | info["hit"]
 
             if torch.any(done):
                 d = done
+
                 t_done = info["t"][d].detach().float().cpu().numpy()
-                h_done = ep_hit[d].detach().float().cpu().numpy()
-                for tt, hh in zip(t_done.tolist(), h_done.tolist()):
+
+                # ✅ 이 env 규칙: done은 "hit" 또는 "timeout(max_steps)"
+                # - hit이면 death=1
+                # - hit이 아니면 timeout(clear)=1
+                done_hit = info["hit"][d].detach().bool()
+                done_clear = (~done_hit)
+
+                death_arr = done_hit.detach().float().cpu().numpy()
+                clear_arr = done_clear.detach().float().cpu().numpy()
+
+                for tt, dd, cc in zip(t_done.tolist(), death_arr.tolist(), clear_arr.tolist()):
                     recent_surv.append(float(tt))
-                    recent_hit.append(float(hh))
+                    recent_death_end.append(float(dd))
+                    recent_clear_end.append(float(cc))
                     done_eps += 1
 
                 obs_reset, _ = env.reset(mask=d)
                 next_obs[d] = obs_reset[d]
-                ep_hit[d] = False
 
             obs = next_obs
             global_step += int(args.n_envs)
 
-        # PPO update
         agent.finish_and_update(
             last_obs=obs,
             last_done=torch.zeros((args.n_envs,), device=device, dtype=torch.bool),
@@ -478,67 +438,60 @@ def main():
             sps = run_steps / dt
 
             avg_surv = float(np.mean(recent_surv)) if recent_surv else 0.0
-            hit_rate = float(np.mean(recent_hit)) if recent_hit else 0.0
-            n = len(recent_hit)
+            death_rate = float(np.mean(recent_death_end)) if recent_death_end else 0.0
+            clear_rate = float(np.mean(recent_clear_end)) if recent_clear_end else 0.0
+            n = len(recent_death_end)
 
             spawn_s = float(env.get_spawn_rate_s())
             global_episode = base_global_episode + int(done_eps)
 
-            hist_avg_surv.append(avg_surv)
-            hist_hit_rate.append(hit_rate)
-
-            # -------------------------
-            # ENT auto-tuning only
-            # -------------------------
-            ent_msg = ""
-            if AUTO_ENT_ENABLED and (n >= AUTO_DIFF_MIN_READY):
-                plateau = False
-                improved = False
-                worsened = False
-
-                if len(hist_hit_rate) >= PLATEAU_WINDOW_LOGS:
-                    prev = list(hist_hit_rate)[:-1]
-                    cur = float(hist_hit_rate[-1])
-                    prev_best = float(min(prev))  # 낮을수록 좋음
-
-                    improved = (cur <= prev_best - HIT_IMPROVE_EPS)
-                    worsened = (cur >= prev_best + HIT_WORSEN_EPS)
-
-                    if len(hist_avg_surv) >= PLATEAU_WINDOW_LOGS:
-                        surv_span = float(max(hist_avg_surv) - min(hist_avg_surv))
-                        if (not improved) and (not worsened) and (surv_span < PLATEAU_MIN_SURV_IMPROVE):
-                            plateau = True
-
-                ent0 = _get_ent_coef(agent, ppo_cfg)
-                ent1 = ent0
-
-                if worsened:
-                    ent1 = min(ENT_MAX, ent0 * ENT_UP)
-                elif plateau:
-                    ent1 = min(ENT_MAX, ent0 * ENT_UP)
-                elif improved:
-                    ent1 = max(ENT_MIN, ent0 * ENT_DOWN)
-
-                if abs(ent1 - ent0) > 1e-12:
-                    _set_ent_coef(agent, ppo_cfg, ent1)
-                    tag = "worsen" if worsened else ("plateau" if plateau else "improve")
-                    ent_msg = f" ent{ent0:.4f}->{ent1:.4f}({tag})"
-
-            if ent_msg:
-                last_ent_msg = ent_msg
-
-            extra = f" |TUNE:{last_ent_msg}" if last_ent_msg else ""
-
             print(
                 f"[EP_DONE {next_log_ep:7d}/{args.episodes}] "
-                f"surv_avg{ROLLING_N}={avg_surv:5.2f}s hit_rate{ROLLING_N}={hit_rate:5.3f} "
+                f"surv_avg{ROLLING_N}={avg_surv:5.2f}s "
+                f"fail_rate{ROLLING_N}={death_rate:5.3f} "
+                f"clear_rate{ROLLING_N}={clear_rate:5.3f} "
                 f"spawn={spawn_s:7.2f}/s "
                 f"global_episode={global_episode} "
                 f"(n={n:2d}) steps={global_step} SPS={sps:7.1f}"
-                f"{extra}"
             )
 
-            # save latest
+            window_ready = (n >= AUTO_DIFF_MIN_READY)
+
+            # -------------------------
+            # Auto difficulty update (연속 통과)
+            # 기준: death_rate <= target
+            # -------------------------
+            if diff_cooldown > 0:
+                diff_cooldown -= 1
+
+            eligible_for_diff = AUTO_DIFF_ENABLED and window_ready and (diff_cooldown == 0)
+            if eligible_for_diff:
+                if death_rate <= AUTO_DIFF_TARGET_HIT + 1e-12:
+                    diff_pass_streak += 1
+                else:
+                    diff_pass_streak = 0
+
+                if (
+                    diff_pass_streak >= DIFF_PASS_STREAK_REQ
+                    and manual_spawn < float(env_cfg.spawn_rate) - 1e-9
+                ):
+                    old_spawn = float(manual_spawn)
+                    manual_spawn = float(np.clip(old_spawn + float(AUTO_DIFF_STEP_SPAWN), 0.0, float(env_cfg.spawn_rate)))
+                    env.set_manual_difficulty(manual_spawn, enabled=True)
+
+                    diff_cooldown = int(AUTO_DIFF_COOLDOWN_LOGS)
+                    diff_pass_streak = 0
+
+                    print(
+                        f"[DIFF] up(+{AUTO_DIFF_STEP_SPAWN:.2f}/s): "
+                        f"spawn {old_spawn:.2f} -> {manual_spawn:.2f}/s  "
+                        f"(death_rate{ROLLING_N}={death_rate:.3f} <= {AUTO_DIFF_TARGET_HIT:.3f})  "
+                        f"cooldown_logs={diff_cooldown} streak_req={DIFF_PASS_STREAK_REQ}"
+                    )
+
+            # -------------------------
+            # ✅ save latest AFTER diff update
+            # -------------------------
             payload = _pack_checkpoint(
                 agent=agent,
                 ppo_cfg=ppo_cfg,
@@ -552,23 +505,17 @@ def main():
             _save_checkpoint(payload, CKPT_LATEST)
 
             # -------------------------
-            # ✅ BEST update
-            # 1) spawn 증가가 최우선
-            # 2) spawn 같으면 hit_rate 낮아지면(best)
-            # 3) 위 둘 다 tie면 avg_surv가 높으면(best)
+            # ✅ BEST update (payload 재사용: RNG/weight 시점 흔들림 최소화)
             # -------------------------
-            window_ready = (n >= AUTO_DIFF_MIN_READY)
             eligible_best = window_ready and (next_log_ep >= BEST_MIN_EPISODES)
-
             if eligible_best:
                 spawn_now = float(spawn_s)
 
                 better_spawn = (spawn_now > float(best_spawn) + BEST_SPAWN_EPS)
                 same_spawn = (abs(spawn_now - float(best_spawn)) <= BEST_SPAWN_EPS)
 
-                # hit_rate는 낮을수록 좋음
-                better_hit = (hit_rate < float(best_hit_rate) - BEST_HIT_MARGIN)
-                tied_hit = (abs(hit_rate - float(best_hit_rate)) <= EPS_TIE)
+                better_death = (death_rate < float(best_death_rate) - BEST_HIT_MARGIN)
+                tied_death = (abs(death_rate - float(best_death_rate)) <= EPS_TIE)
 
                 better_surv = (avg_surv > float(best_avg50) + 1e-9)
 
@@ -578,21 +525,21 @@ def main():
                 if better_spawn:
                     should_update_best = True
                     reason = "spawn increased"
-                elif same_spawn and better_hit:
+                elif same_spawn and better_death:
                     should_update_best = True
-                    reason = "hit_rate improved"
-                elif same_spawn and tied_hit and better_surv:
+                    reason = "death_rate improved"
+                elif same_spawn and tied_death and better_surv:
                     should_update_best = True
                     reason = "tie: survival improved"
 
                 if should_update_best:
                     best_spawn = float(spawn_now)
-                    best_hit_rate = float(hit_rate)
+                    best_death_rate = float(death_rate)
                     best_avg50 = float(avg_surv)
 
                     best_payload = dict(payload)
                     best_payload["best_spawn"] = float(best_spawn)
-                    best_payload["best_hit_rate50"] = float(best_hit_rate)
+                    best_payload["best_death_rate50"] = float(best_death_rate)
                     best_payload["best_avg50"] = float(best_avg50)
                     best_payload["manual_spawn"] = float(manual_spawn)
 
@@ -601,31 +548,10 @@ def main():
                     print(
                         f"[BEST] updated ({reason}) "
                         f"best_spawn={best_spawn:.2f}/s "
-                        f"best_hit_rate{ROLLING_N}={best_hit_rate:.4f} "
+                        f"best_death_rate{ROLLING_N}={best_death_rate:.4f} "
                         f"best_avg{ROLLING_N}={best_avg50:.2f}s "
                         f"best_path={CKPT_BEST}"
                     )
-
-            # -------------------------
-            # Auto difficulty update (spawn +5.0)
-            # -------------------------
-            if diff_cooldown > 0:
-                diff_cooldown -= 1
-
-            eligible_for_diff = AUTO_DIFF_ENABLED and window_ready and (diff_cooldown == 0)
-            if eligible_for_diff and (hit_rate <= AUTO_DIFF_TARGET_HIT + 1e-12) and (manual_spawn < float(env_cfg.spawn_rate) - 1e-9):
-                old_spawn = float(manual_spawn)
-                manual_spawn = float(np.clip(old_spawn + float(AUTO_DIFF_STEP_SPAWN), 0.0, float(env_cfg.spawn_rate)))
-                env.set_manual_difficulty(manual_spawn, enabled=True)
-
-                diff_cooldown = int(AUTO_DIFF_COOLDOWN_LOGS)
-
-                print(
-                    f"[DIFF] up(+{AUTO_DIFF_STEP_SPAWN:.2f}/s): "
-                    f"spawn {old_spawn:.2f} -> {manual_spawn:.2f}/s  "
-                    f"(hit_rate{ROLLING_N}={hit_rate:.3f} <= {AUTO_DIFF_TARGET_HIT:.3f})  "
-                    f"cooldown_logs={diff_cooldown}"
-                )
 
             next_log_ep = ((done_eps // LOG_EVERY) + 1) * LOG_EVERY
 
