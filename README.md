@@ -66,6 +66,6 @@ python train.py --episodes 500000 --no-render
 
 학습 파일은 checkpoints폴더에 저장됨.
 
-
-<img width="717" height="782" alt="스크린샷 2026-01-22 104506" src="https://github.com/user-attachments/assets/3ea70a22-c87f-490f-8727-680ec1324b80" />
+<img width="715" height="786" alt="스크린샷 2026-01-22 104659" src="https://github.com/user-attachments/assets/76647b0e-d88b-400c-a3dc-5476902f91e7" />
+<img width="720" height="782" alt="스크린샷 2026-01-22 104725" src="https://github.com/user-attachments/assets/8159bdff-7aec-49b0-b6a2-23da8a8aecca" />
 
