@@ -67,6 +67,7 @@ no-render 모드에서는 CUDA 기반 GPU 연산을 사용하며, 32개의 벡�
 따라서 render 모드보다 훨씬 빠른 속도로 학습이 가능합니다.
 학습 파일은 checkpoints폴더에 저장됨.
 
+## torch_config.py
 ```
 class EnvConfig:
     # world
