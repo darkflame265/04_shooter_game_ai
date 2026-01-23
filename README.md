@@ -63,7 +63,8 @@ python train.py --episodes 500000
 ```powershell
 python train.py --episodes 500000 --no-render
 ```
-
+no-render 모드에서는 CUDA 기반 GPU 연산을 사용하며, 32개의 벡터 환경(vec env)을 동시에 실행하여 병렬로 강화학습을 진행합니다.
+따라서 render 모드보다 훨씬 빠른 속도로 학습이 가능합니다.
 학습 파일은 checkpoints폴더에 저장됨.
 
 ```
